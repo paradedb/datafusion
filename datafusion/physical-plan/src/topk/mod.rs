@@ -412,8 +412,9 @@ impl TopK {
         if let Some(pred) = predicate
             && !pred.eq(&lit(true))
         {
-            eprintln!("TopK filter updated: {}", pred);
+            let pred_clone = Arc::clone(&pred);
             filter.expr.update(pred)?;
+            eprintln!("TopK filter updated: {} - {:?}", pred_clone, filter.expr);
         }
 
         Ok(())
