@@ -465,10 +465,7 @@ impl Stream for ProjectionStream {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Self::Item>> {
         let poll = self.input.poll_next_unpin(cx).map(|x| match x {
-            Some(Ok(batch)) => {
-                eprintln!("ProjectionExec consumed {} rows from input", batch.num_rows());
-                Some(self.batch_project(&batch))
-            }
+            Some(Ok(batch)) => Some(self.batch_project(&batch)),
             other => other,
         });
 

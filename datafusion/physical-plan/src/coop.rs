@@ -150,9 +150,6 @@ where
             let value = self.inner.poll_next_unpin(cx);
             if value.is_ready() {
                 coop.made_progress();
-                if let Poll::Ready(Some(Ok(ref batch))) = value {
-                    eprintln!("CooperativeExec consumed {} rows from input", batch.num_rows());
-                }
             }
             value
         }
@@ -176,9 +173,6 @@ where
                 let consume = tokio::task::coop::consume_budget();
                 let consume_ref = std::pin::pin!(consume);
                 let _ = consume_ref.poll(cx);
-                if let Poll::Ready(Some(Ok(ref batch))) = value {
-                    eprintln!("CooperativeExec consumed {} rows from input", batch.num_rows());
-                }
             }
             value
         }
@@ -195,9 +189,6 @@ where
 
             if value.is_ready() {
                 self.budget -= 1;
-                if let Poll::Ready(Some(Ok(ref batch))) = value {
-                    eprintln!("CooperativeExec consumed {} rows from input", batch.num_rows());
-                }
             } else {
                 self.budget = YIELD_FREQUENCY;
             }

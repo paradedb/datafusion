@@ -867,7 +867,6 @@ impl Stream for SortMergeJoinStream {
                             .joined_batches
                             .next_completed_batch()
                             .expect("has_completed_batch was true");
-                        eprintln!("SortMergeJoinExec yielded an output batch of {} rows (JoinOutput)", record_batch.num_rows());
                         (&record_batch)
                             .record_output(&self.join_metrics.baseline_metrics());
                         return Poll::Ready(Some(Ok(record_batch)));
@@ -884,7 +883,6 @@ impl Stream for SortMergeJoinStream {
                         && !self.joined_record_batches.joined_batches.is_empty()
                     {
                         let record_batch = self.filter_joined_batch()?;
-                        eprintln!("SortMergeJoinExec yielded an output batch of {} rows (Exhausted, filtered)", record_batch.num_rows());
                         (&record_batch)
                             .record_output(&self.join_metrics.baseline_metrics());
                         return Poll::Ready(Some(Ok(record_batch)));
@@ -908,7 +906,6 @@ impl Stream for SortMergeJoinStream {
                             .joined_batches
                             .next_completed_batch()
                             .expect("has_completed_batch was true");
-                        eprintln!("SortMergeJoinExec yielded an output batch of {} rows (Exhausted, next_completed)", record_batch.num_rows());
                         (&record_batch)
                             .record_output(&self.join_metrics.baseline_metrics());
                         return Poll::Ready(Some(Ok(record_batch)));
@@ -921,7 +918,6 @@ impl Stream for SortMergeJoinStream {
                             .output
                             .next_completed_batch()
                             .expect("Failed to get last batch");
-                        eprintln!("SortMergeJoinExec yielded an output batch of {} rows (Exhausted, coalescer)", record_batch.num_rows());
                         (&record_batch)
                             .record_output(&self.join_metrics.baseline_metrics());
                         Poll::Ready(Some(Ok(record_batch)))
@@ -1044,7 +1040,6 @@ impl SortMergeJoinStream {
                     .output
                     .next_completed_batch()
                     .expect("Failed to get output batch");
-                eprintln!("SortMergeJoinExec yielded an output batch of {} rows (Filtered batches)", record_batch.num_rows());
                 (&record_batch).record_output(&self.join_metrics.baseline_metrics());
                 return Poll::Ready(Some(Ok(record_batch)));
             }
@@ -1075,7 +1070,6 @@ impl SortMergeJoinStream {
                         self.streamed_state = StreamedState::Exhausted;
                     }
                     Poll::Ready(Some(batch)) => {
-                        eprintln!("SortMergeJoinExec consumed {} rows from left (streamed) input", batch.num_rows());
                         if batch.num_rows() > 0 {
                             self.freeze_streamed()?;
                             self.join_metrics.input_batches().add(1);
@@ -1184,7 +1178,6 @@ impl SortMergeJoinStream {
                         return Poll::Ready(None);
                     }
                     Poll::Ready(Some(batch)) => {
-                        eprintln!("SortMergeJoinExec consumed {} rows from right (buffered) input", batch.num_rows());
                         self.join_metrics.input_batches().add(1);
                         self.join_metrics.input_rows().add(batch.num_rows());
 
@@ -1225,7 +1218,6 @@ impl SortMergeJoinStream {
                                 self.buffered_state = BufferedState::Ready;
                             }
                             Poll::Ready(Some(batch)) => {
-                                eprintln!("SortMergeJoinExec consumed {} rows from right (buffered) input", batch.num_rows());
                                 // Polling batches coming concurrently as multiple partitions
                                 self.join_metrics.input_batches().add(1);
                                 self.join_metrics.input_rows().add(batch.num_rows());
