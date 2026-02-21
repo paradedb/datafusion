@@ -125,6 +125,8 @@ pub struct TopK {
     common_sort_prefix: Arc<[PhysicalSortExpr]>,
     /// Filter matching the state of the `TopK` heap used for dynamic filter pushdown
     filter: Arc<RwLock<TopKDynamicFilters>>,
+    /// Total number of rows consumed by this TopK instance
+    total_rows_consumed: usize,
     /// If true, indicates that all rows of subsequent batches are guaranteed
     /// to be greater (by byte order, after row conversion) than the top K,
     /// which means the top K won't change and the computation can be finished early.
@@ -220,6 +222,7 @@ impl TopK {
             heap: TopKHeap::new(k, batch_size),
             common_sort_prefix_converter: prefix_row_converter,
             common_sort_prefix: Arc::from(common_sort_prefix),
+            total_rows_consumed: 0,
             finished: false,
             filter,
         })
@@ -229,6 +232,14 @@ impl TopK {
     /// the top k seen so far.
     #[expect(clippy::needless_pass_by_value)]
     pub fn insert_batch(&mut self, batch: RecordBatch) -> Result<()> {
+        let num_rows = batch.num_rows();
+        self.total_rows_consumed += num_rows;
+
+        eprintln!(
+            "TopK: insert_batch with {} rows. Total consumed: {}",
+            num_rows, self.total_rows_consumed
+        );
+
         // Updates on drop
         let baseline = self.metrics.baseline.clone();
         let _timer = baseline.elapsed_compute().timer();
@@ -292,6 +303,10 @@ impl TopK {
         };
 
         if replacements > 0 {
+            eprintln!(
+                "TopK: {} replacements in current batch. Total consumed: {}",
+                replacements, self.total_rows_consumed
+            );
             self.metrics.row_replacements.add(replacements);
 
             self.heap.insert_batch_entry(batch_entry);
@@ -349,6 +364,7 @@ impl TopK {
     fn update_filter(&mut self) -> Result<()> {
         // If the heap doesn't have k elements yet, we can't create thresholds
         let Some(max_row) = self.heap.max() else {
+            eprintln!("TopK: update_filter skipped - heap not full (len={})", self.heap.inner.len());
             return Ok(());
         };
 
@@ -363,7 +379,11 @@ impl TopK {
             .as_ref()
             .map(|current_row| {
                 // new < current means new threshold is more selective
-                new_threshold_row < current_row
+                let is_better = new_threshold_row < current_row;
+                if !is_better {
+                    eprintln!("TopK: update_filter skipped - new threshold not more selective than current");
+                }
+                is_better
             })
             .unwrap_or(true); // No current threshold, so we need to set one
 
@@ -372,10 +392,15 @@ impl TopK {
             return Ok(());
         }
 
+        eprintln!("TopK: update_filter proceeding. Total consumed: {}", self.total_rows_consumed);
+
         // Extract scalar values BEFORE acquiring lock to reduce critical section
         let thresholds = match self.heap.get_threshold_values(&self.expr)? {
             Some(t) => t,
-            None => return Ok(()),
+            None => {
+                eprintln!("TopK: update_filter failed to get threshold values");
+                return Ok(());
+            }
         };
 
         // Build the filter expression OUTSIDE any synchronization
@@ -398,6 +423,7 @@ impl TopK {
                     // some other thread updated the threshold to a better
                     // one while we were building so there is no need to
                     // update the filter
+                    eprintln!("TopK: update_filter skipped - threshold updated by another thread");
                     filter.threshold_row = Some(old_threshold);
                     return Ok(());
                 }
@@ -414,7 +440,7 @@ impl TopK {
         {
             let pred_clone = Arc::clone(&pred);
             filter.expr.update(pred)?;
-            eprintln!("TopK filter updated: {} - {:?}", pred_clone, filter.expr);
+            eprintln!("TopK: Filter updated to: {}. Total rows consumed: {}", pred_clone, self.total_rows_consumed);
         }
 
         Ok(())
@@ -594,6 +620,7 @@ impl TopK {
             mut heap,
             common_sort_prefix_converter: _,
             common_sort_prefix: _,
+            total_rows_consumed: _,
             finished: _,
             filter,
         } = self;
