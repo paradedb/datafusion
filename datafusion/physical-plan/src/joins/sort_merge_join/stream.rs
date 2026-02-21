@@ -833,40 +833,44 @@ impl Stream for SortMergeJoinStream {
                 SortMergeJoinState::JoinOutput => {
                     self.join_partial()?;
 
-                    if self.num_unfrozen_pairs() < self.batch_size {
-                        if self.buffered_data.scanning_finished() {
-                            self.buffered_data.scanning_reset();
-                            self.state = SortMergeJoinState::Init;
-                        }
-                    } else {
-                        self.freeze_all()?;
+                    let num_unfrozen_pairs = self.num_unfrozen_pairs();
 
+                    // 1. If we have generated a massive number of matches for a single streamed row
+                    // (>= batch_size), freeze them early to prevent runaway memory usage for a single chunk.
+                    if num_unfrozen_pairs >= self.batch_size {
+                        self.freeze_all()?;
                         // Verify metadata alignment before checking if we have batches to output
                         self.joined_record_batches.debug_assert_metadata_aligned();
+                    } else if self.buffered_data.scanning_finished() {
+                        // 2. Otherwise, if we have finished checking all buffered rows against the current
+                        // streamed row, reset the scan state and go back to Init to fetch the next streamed row.
+                        self.buffered_data.scanning_reset();
+                        self.state = SortMergeJoinState::Init;
+                    }
 
-                        // For filtered joins, skip output and let Init state handle it
-                        if self.needs_deferred_filtering() {
-                            continue;
-                        }
-
-                        // For non-filtered joins, only output if we have a completed batch
-                        // (opportunistic output when target batch size is reached)
-                        if self
+                    // 3. Opportunistic Output
+                    // Regardless of whether we froze a large chunk or are fetching the next row,
+                    // we check if `joined_record_batches` has accumulated enough rows across multiple
+                    // streamed inputs to emit a complete RecordBatch.
+                    //
+                    // Note: For filtered joins (like LEFT/ANTI), we CANNOT opportunistically emit batches here.
+                    // The filter must evaluate all matches for a given row before we know if we need
+                    // to emit a NULL-padded row, so we defer outputting to the `Init` and `Exhausted` states.
+                    if !self.needs_deferred_filtering()
+                        && self
                             .joined_record_batches
                             .joined_batches
                             .has_completed_batch()
-                        {
-                            let record_batch = self
-                                .joined_record_batches
-                                .joined_batches
-                                .next_completed_batch()
-                                .expect("has_completed_batch was true");
-                            eprintln!("SortMergeJoinExec yielded an output batch of {} rows (JoinOutput)", record_batch.num_rows());
-                            (&record_batch)
-                                .record_output(&self.join_metrics.baseline_metrics());
-                            return Poll::Ready(Some(Ok(record_batch)));
-                        }
-                        // Otherwise keep buffering (don't output yet)
+                    {
+                        let record_batch = self
+                            .joined_record_batches
+                            .joined_batches
+                            .next_completed_batch()
+                            .expect("has_completed_batch was true");
+                        eprintln!("SortMergeJoinExec yielded an output batch of {} rows (JoinOutput)", record_batch.num_rows());
+                        (&record_batch)
+                            .record_output(&self.join_metrics.baseline_metrics());
+                        return Poll::Ready(Some(Ok(record_batch)));
                     }
                 }
                 SortMergeJoinState::Exhausted => {
