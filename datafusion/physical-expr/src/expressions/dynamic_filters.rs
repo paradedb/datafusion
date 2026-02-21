@@ -51,7 +51,6 @@ impl FilterState {
 /// Any `ExecutionPlan` that uses this expression and holds a reference to it internally should probably also
 /// implement `ExecutionPlan::reset_state` to remain compatible with recursive queries and other situations where
 /// the same `ExecutionPlan` is reused with different data.
-#[derive(Debug)]
 pub struct DynamicFilterPhysicalExpr {
     /// The original children of this PhysicalExpr, if any.
     /// This is necessary because the dynamic filter may be initialized with a placeholder (e.g. `lit(true)`)
@@ -126,6 +125,20 @@ impl PartialEq for DynamicFilterPhysicalExpr {
 }
 
 impl Eq for DynamicFilterPhysicalExpr {}
+
+impl std::fmt::Debug for DynamicFilterPhysicalExpr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DynamicFilterPhysicalExpr")
+            .field("inner_ptr", &format_args!("{:p}", Arc::as_ptr(&self.inner)))
+            .field("inner", &self.inner)
+            .field("children", &self.children)
+            .field("remapped_children", &self.remapped_children)
+            .field("state_watch", &self.state_watch)
+            .field("data_type", &self.data_type)
+            .field("nullable", &self.nullable)
+            .finish()
+    }
+}
 
 impl Display for DynamicFilterPhysicalExpr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
