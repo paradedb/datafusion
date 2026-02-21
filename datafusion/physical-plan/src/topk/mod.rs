@@ -412,6 +412,7 @@ impl TopK {
         if let Some(pred) = predicate
             && !pred.eq(&lit(true))
         {
+            eprintln!("TopK filter updated: {}", pred);
             filter.expr.update(pred)?;
         }
 
