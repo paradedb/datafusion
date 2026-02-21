@@ -1311,6 +1311,7 @@ impl ExecutionPlan for SortExec {
                     futures::stream::once(async move {
                         while let Some(batch) = input.next().await {
                             let batch = batch?;
+                            eprintln!("SortExec consumed {} rows from input", batch.num_rows());
                             topk.insert_batch(batch)?;
                             if topk.finished {
                                 break;
@@ -1338,6 +1339,7 @@ impl ExecutionPlan for SortExec {
                     futures::stream::once(async move {
                         while let Some(batch) = input.next().await {
                             let batch = batch?;
+                            eprintln!("SortExec consumed {} rows from input", batch.num_rows());
                             sorter.insert_batch(batch).await?;
                         }
                         sorter.sort().await

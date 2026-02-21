@@ -197,6 +197,7 @@ impl<C: CursorValues> SortPreservingMergeStream<C> {
             None => Poll::Ready(Ok(())),
             Some(Err(e)) => Poll::Ready(Err(e)),
             Some(Ok((cursor, batch))) => {
+                eprintln!("SortPreservingMergeExec consumed {} rows from input", batch.num_rows());
                 self.cursors[idx] = Some(Cursor::new(cursor));
                 Poll::Ready(self.in_progress.push_batch(idx, batch))
             }
