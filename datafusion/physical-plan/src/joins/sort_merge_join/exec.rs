@@ -20,7 +20,6 @@
 //! joined output by given join type and other options.
 
 use std::any::Any;
-use std::collections::HashSet;
 use std::fmt::Formatter;
 use std::sync::Arc;
 
@@ -625,21 +624,13 @@ impl ExecutionPlan for SortMergeJoinExec {
         // Build allowed index sets for each side so that
         // `from_child_with_allowed_indices` can route each parent filter to
         // the correct child based on column references.
-        let left_col_count = self.left.schema().fields().len();
-        let total_col_count = self.schema.fields().len();
-
-        let left_allowed: HashSet<usize> = (0..left_col_count).collect();
-        let right_allowed: HashSet<usize> = (left_col_count..total_col_count).collect();
-
-        let left_child = ChildFilterDescription::from_child_with_allowed_indices(
+        let left_child = ChildFilterDescription::from_child(
             &parent_filters,
-            left_allowed,
             &self.left,
         )?;
 
-        let right_child = ChildFilterDescription::from_child_with_allowed_indices(
+        let right_child = ChildFilterDescription::from_child(
             &parent_filters,
-            right_allowed,
             &self.right,
         )?;
 
