@@ -83,9 +83,7 @@ fn right_batch() -> RecordBatch {
             Arc::new(StringArray::from(vec![
                 "eng", "sales", "eng", "hr", "sales", "eng", "hr",
             ])),
-            Arc::new(StringArray::from(vec![
-                "A", "B", "C", "A", "B", "A", "C",
-            ])),
+            Arc::new(StringArray::from(vec!["A", "B", "C", "A", "B", "A", "C"])),
         ],
     )
     .unwrap()
@@ -157,13 +155,7 @@ async fn build_ctx(enable_dynamic_filters: bool) -> SessionContext {
 async fn run_and_compare(query: &str) {
     // Run without dynamic filters (baseline)
     let ctx_off = build_ctx(false).await;
-    let expected = ctx_off
-        .sql(query)
-        .await
-        .unwrap()
-        .collect()
-        .await
-        .unwrap();
+    let expected = ctx_off.sql(query).await.unwrap().collect().await.unwrap();
 
     // Run with dynamic filters
     let ctx_on = build_ctx(true).await;

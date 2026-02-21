@@ -56,7 +56,9 @@ use datafusion_common::{
 use datafusion_execution::TaskContext;
 use datafusion_execution::memory_pool::MemoryConsumer;
 use datafusion_physical_expr::equivalence::join_equivalence_properties;
-use datafusion_physical_expr_common::physical_expr::{PhysicalExpr, PhysicalExprRef, fmt_sql};
+use datafusion_physical_expr_common::physical_expr::{
+    PhysicalExpr, PhysicalExprRef, fmt_sql,
+};
 use datafusion_physical_expr_common::sort_expr::{LexOrdering, OrderingRequirements};
 
 /// Join execution plan that executes equi-join predicates on multiple partitions using Sort-Merge
@@ -624,15 +626,10 @@ impl ExecutionPlan for SortMergeJoinExec {
         // Build allowed index sets for each side so that
         // `from_child_with_allowed_indices` can route each parent filter to
         // the correct child based on column references.
-        let left_child = ChildFilterDescription::from_child(
-            &parent_filters,
-            &self.left,
-        )?;
+        let left_child = ChildFilterDescription::from_child(&parent_filters, &self.left)?;
 
-        let right_child = ChildFilterDescription::from_child(
-            &parent_filters,
-            &self.right,
-        )?;
+        let right_child =
+            ChildFilterDescription::from_child(&parent_filters, &self.right)?;
 
         Ok(FilterDescription::new()
             .with_child(left_child)
