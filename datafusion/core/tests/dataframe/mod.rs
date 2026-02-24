@@ -1450,6 +1450,90 @@ async fn join_on() -> Result<()> {
 }
 
 #[tokio::test]
+async fn left_semi_join_right_extra_projection_non_key_ordinal() -> Result<()> {
+    let ctx = SessionContext::new();
+    let left = ctx
+        .read_batch(record_batch!(
+            ("ctid", Int32, [1, 2, 3]),
+            ("age", Int32, [10, 20, 30]),
+            ("id", Int32, [100, 200, 300])
+        )?)?
+        .select(vec![col("ctid").alias("ctid_1"), col("age"), col("id")])?
+        .alias("l")?;
+    let right = ctx
+        .read_batch(record_batch!(
+            ("ctid", Int32, [11, 12]),
+            ("age", Int32, [20, 40])
+        )?)?
+        .select(vec![col("ctid").alias("ctid_3"), col("age")])?
+        .alias("r")?;
+
+    let joined = left.join_on(
+        right,
+        JoinType::LeftSemi,
+        [col("l.age").eq(col("r.age"))],
+    )?;
+    let _ = joined.clone().create_physical_plan().await?;
+
+    assert_batches_eq!(
+        [
+            "+--------+-----+-----+",
+            "| ctid_1 | age | id  |",
+            "+--------+-----+-----+",
+            "| 2      | 20  | 200 |",
+            "+--------+-----+-----+",
+        ],
+        &joined.collect().await?
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn left_semi_join_right_projection_alias_chain_non_key_ordinal() -> Result<()> {
+    let ctx = SessionContext::new();
+    let left = ctx
+        .read_batch(record_batch!(
+            ("ctid", Int32, [1, 2, 3]),
+            ("age", Int32, [10, 20, 30]),
+            ("id", Int32, [100, 200, 300])
+        )?)?
+        .select(vec![col("ctid").alias("ctid_1"), col("age"), col("id")])?
+        .alias("l")?;
+    let right = ctx
+        .read_batch(record_batch!(
+            ("ctid", Int32, [11, 12]),
+            ("age", Int32, [20, 40])
+        )?)?
+        .alias("r_base")?
+        .select(vec![
+            col("r_base.ctid").alias("ctid_3"),
+            col("r_base.age").alias("age"),
+        ])?
+        .alias("r_proj")?
+        .select(vec![col("r_proj.ctid_3"), col("r_proj.age")])?
+        .alias("r")?;
+
+    let joined = left.join_on(
+        right,
+        JoinType::LeftSemi,
+        [col("l.age").eq(col("r.age"))],
+    )?;
+    let _ = joined.clone().create_physical_plan().await?;
+
+    assert_batches_eq!(
+        [
+            "+--------+-----+-----+",
+            "| ctid_1 | age | id  |",
+            "+--------+-----+-----+",
+            "| 2      | 20  | 200 |",
+            "+--------+-----+-----+",
+        ],
+        &joined.collect().await?
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn join_on_filter_datatype() -> Result<()> {
     let left = test_table_with_name("a").await?.select_columns(&["c1"])?;
     let right = test_table_with_name("b").await?.select_columns(&["c1"])?;

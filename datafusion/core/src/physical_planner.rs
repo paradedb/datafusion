@@ -91,7 +91,9 @@ use datafusion_expr::{
     WindowFrame, WindowFrameBound, WriteOp,
 };
 use datafusion_physical_expr::aggregate::{AggregateExprBuilder, AggregateFunctionExpr};
+use datafusion_physical_expr::expressions::Column as PhysicalColumn;
 use datafusion_physical_expr::expressions::Literal;
+use datafusion_physical_expr::utils::reassign_expr_columns;
 use datafusion_physical_expr::{
     LexOrdering, PhysicalSortExpr, create_physical_sort_exprs,
 };
@@ -1220,8 +1222,16 @@ impl DefaultPhysicalPlanner {
                     .iter()
                     .map(|(l, r)| {
                         let l = create_physical_expr(l, left_df_schema, execution_props)?;
+                        let l = realign_expr_columns_if_needed(
+                            l,
+                            physical_left.schema().as_ref(),
+                        )?;
                         let r =
                             create_physical_expr(r, right_df_schema, execution_props)?;
+                        let r = realign_expr_columns_if_needed(
+                            r,
+                            physical_right.schema().as_ref(),
+                        )?;
                         Ok((l, r))
                     })
                     .collect::<Result<join_utils::JoinOn>>()?;
@@ -1899,6 +1909,33 @@ fn get_physical_expr_pair(
         create_physical_expr(expr, input_dfschema, session_state.execution_props())?;
     let physical_name = physical_name(expr)?;
     Ok((physical_expr, physical_name))
+}
+
+/// Reassign physical expression column indices to `schema` only when existing
+/// column references are inconsistent with it.
+fn realign_expr_columns_if_needed(
+    expr: Arc<dyn PhysicalExpr>,
+    schema: &Schema,
+) -> Result<Arc<dyn PhysicalExpr>> {
+    let mut needs_reassign = false;
+    expr.apply(|node| {
+        if let Some(col) = node.as_any().downcast_ref::<PhysicalColumn>() {
+            let index = col.index();
+            let invalid_index = index >= schema.fields().len();
+            let mismatched_name = !invalid_index && schema.field(index).name() != col.name();
+            if invalid_index || mismatched_name {
+                needs_reassign = true;
+                return Ok(TreeNodeRecursion::Stop);
+            }
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })?;
+
+    if needs_reassign {
+        reassign_expr_columns(expr, schema)
+    } else {
+        Ok(expr)
+    }
 }
 
 /// Extract filter predicates from a DML input plan (DELETE/UPDATE).
@@ -2584,7 +2621,13 @@ impl DefaultPhysicalPlanner {
                 };
 
                 let physical_expr =
-                    self.create_physical_expr(e, input_logical_schema, session_state);
+                    self.create_physical_expr(e, input_logical_schema, session_state)
+                        .and_then(|expr| {
+                            realign_expr_columns_if_needed(
+                                expr,
+                                input_physical_schema.as_ref(),
+                            )
+                        });
 
                 tuple_err((physical_expr, physical_name))
             })
