@@ -60,6 +60,7 @@ use crate::joins::utils::{ColumnIndex, JoinFilter, JoinOn};
 use crate::test::TestMemoryExec;
 use crate::test::{build_table_i32, build_table_i32_two_cols};
 use crate::{ExecutionPlan, common};
+use futures::StreamExt;
 
 fn build_table(
     a: (&str, &Vec<i32>),
@@ -69,6 +70,71 @@ fn build_table(
     let batch = build_table_i32(a, b, c);
     let schema = batch.schema();
     TestMemoryExec::try_new_exec(&[vec![batch]], schema, None).unwrap()
+}
+
+#[tokio::test]
+async fn test_sort_merge_join_dynamic_filter_initial_bound() -> Result<()> {
+    let left = build_table(
+        ("a1", &vec![10, 20, 30]),
+        ("b1", &vec![4, 5, 6]),
+        ("c1", &vec![7, 8, 9]),
+    );
+    let right = build_table(
+        ("a2", &vec![15, 25, 35]),
+        ("b2", &vec![4, 5, 6]),
+        ("c2", &vec![7, 8, 9]),
+    );
+
+    let on = vec![(
+        Arc::new(Column::new("a1", 0)) as _,
+        Arc::new(Column::new("a2", 0)) as _,
+    )];
+
+    let join = SortMergeJoinExec::try_new(
+        left,
+        right,
+        on.clone(),
+        None,
+        Inner,
+        vec![SortOptions::default()],
+        NullEquality::NullEqualsNothing,
+    )?;
+
+    // Create dynamic filters
+    let left_filter_expr = SortMergeJoinExec::create_dynamic_filter(&on, JoinSide::Left);
+    let right_filter_expr =
+        SortMergeJoinExec::create_dynamic_filter(&on, JoinSide::Right);
+
+    let left_filter_clone = Arc::clone(&left_filter_expr);
+    let right_filter_clone = Arc::clone(&right_filter_expr);
+
+    let join = join
+        .with_left_dynamic_filter(left_filter_expr)
+        .with_right_dynamic_filter(right_filter_expr);
+
+    let context = TaskContext::default();
+    let mut stream = join.execute(0, Arc::new(context))?;
+
+    // Before polling, filters should be empty
+    assert_eq!(format!("{}", left_filter_clone), "DynamicFilter [ empty ]");
+    assert_eq!(format!("{}", right_filter_clone), "DynamicFilter [ empty ]");
+
+    // Poll once to trigger initial batch reading
+    let _batch = stream.next().await.transpose()?;
+
+    // After polling, both sides should have reported their first values.
+    // Left side first value: 10 -> Right side filter: a2@0 >= 10
+    // Right side first value: 15 -> Left side filter: a1@0 >= 15
+    assert_eq!(
+        format!("{}", left_filter_clone),
+        "DynamicFilter [ a1@0 >= 15 ]"
+    );
+    assert_eq!(
+        format!("{}", right_filter_clone),
+        "DynamicFilter [ a2@0 >= 10 ]"
+    );
+
+    Ok(())
 }
 
 fn build_table_from_batches(batches: Vec<RecordBatch>) -> Arc<dyn ExecutionPlan> {

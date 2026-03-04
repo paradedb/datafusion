@@ -359,6 +359,19 @@ impl ChildFilterDescription {
         })
     }
 
+    /// Create a child filter description where all parent filters are marked as unsupported,
+    /// and no self filters are pushed down.
+    pub fn all_unsupported(parent_filters: &[Arc<dyn PhysicalExpr>]) -> Self {
+        let parent_filters = parent_filters
+            .iter()
+            .map(|f| PushedDownPredicate::unsupported(Arc::clone(f)))
+            .collect();
+        Self {
+            parent_filters,
+            self_filters: vec![],
+        }
+    }
+
     /// Add a self filter (from the current node) to be pushed down to this child.
     pub fn with_self_filter(mut self, filter: Arc<dyn PhysicalExpr>) -> Self {
         self.self_filters.push(filter);
