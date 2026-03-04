@@ -28,6 +28,10 @@ use super::{
     SendableRecordBatchStream, Statistics,
 };
 use crate::execution_plan::{Boundedness, CardinalityEffect};
+use crate::filter_pushdown::{
+    ChildPushdownResult, FilterDescription, FilterPushdownPhase,
+    FilterPushdownPropagation,
+};
 use crate::{
     DisplayFormatType, Distribution, ExecutionPlan, Partitioning,
     check_if_same_properties,
@@ -35,8 +39,10 @@ use crate::{
 
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
+use datafusion_common::config::ConfigOptions;
 use datafusion_common::{Result, assert_eq_or_internal_err, internal_err};
 use datafusion_execution::TaskContext;
+use datafusion_physical_expr::PhysicalExpr;
 
 use datafusion_physical_expr::LexOrdering;
 use futures::stream::{Stream, StreamExt};
@@ -237,6 +243,32 @@ impl ExecutionPlan for GlobalLimitExec {
     fn supports_limit_pushdown(&self) -> bool {
         true
     }
+
+    fn gather_filters_for_pushdown(
+        &self,
+        _phase: FilterPushdownPhase,
+        parent_filters: Vec<Arc<dyn PhysicalExpr>>,
+        _config: &ConfigOptions,
+    ) -> Result<FilterDescription> {
+        FilterDescription::from_children(parent_filters, &self.children())
+    }
+
+    fn handle_child_pushdown_result(
+        &self,
+        _phase: FilterPushdownPhase,
+        child_pushdown_result: ChildPushdownResult,
+        _config: &ConfigOptions,
+    ) -> Result<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
+        let mut result = FilterPushdownPropagation::if_all(child_pushdown_result);
+        if let Some(updated_child) = result.updated_node {
+            result.updated_node = Some(Arc::new(GlobalLimitExec::new(
+                updated_child,
+                self.skip,
+                self.fetch,
+            )) as _);
+        }
+        Ok(result)
+    }
 }
 
 /// LocalLimitExec applies a limit to a single partition
@@ -408,6 +440,29 @@ impl ExecutionPlan for LocalLimitExec {
 
     fn cardinality_effect(&self) -> CardinalityEffect {
         CardinalityEffect::LowerEqual
+    }
+
+    fn gather_filters_for_pushdown(
+        &self,
+        _phase: FilterPushdownPhase,
+        parent_filters: Vec<Arc<dyn PhysicalExpr>>,
+        _config: &ConfigOptions,
+    ) -> Result<FilterDescription> {
+        FilterDescription::from_children(parent_filters, &self.children())
+    }
+
+    fn handle_child_pushdown_result(
+        &self,
+        _phase: FilterPushdownPhase,
+        child_pushdown_result: ChildPushdownResult,
+        _config: &ConfigOptions,
+    ) -> Result<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
+        let mut result = FilterPushdownPropagation::if_all(child_pushdown_result);
+        if let Some(updated_child) = result.updated_node {
+            result.updated_node =
+                Some(Arc::new(LocalLimitExec::new(updated_child, self.fetch)) as _);
+        }
+        Ok(result)
     }
 }
 

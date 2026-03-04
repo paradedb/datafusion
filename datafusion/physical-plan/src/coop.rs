@@ -342,7 +342,12 @@ impl ExecutionPlan for CooperativeExec {
         child_pushdown_result: ChildPushdownResult,
         _config: &ConfigOptions,
     ) -> Result<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
-        Ok(FilterPushdownPropagation::if_all(child_pushdown_result))
+        let mut result = FilterPushdownPropagation::if_all(child_pushdown_result);
+        if let Some(updated_child) = result.updated_node {
+            result.updated_node =
+                Some(Arc::new(CooperativeExec::new(updated_child)) as _);
+        }
+        Ok(result)
     }
 
     fn try_pushdown_sort(

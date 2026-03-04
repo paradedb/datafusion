@@ -32,7 +32,8 @@ use crate::execution_plan::{
 };
 use crate::expressions::PhysicalSortExpr;
 use crate::filter_pushdown::{
-    ChildFilterDescription, FilterDescription, FilterPushdownPhase,
+    ChildFilterDescription, ChildPushdownResult, FilterDescription, FilterPushdownPhase,
+    FilterPushdownPropagation,
 };
 use crate::limit::LimitStream;
 use crate::metrics::{
@@ -1387,6 +1388,21 @@ impl ExecutionPlan for SortExec {
         }
 
         Ok(FilterDescription::new().with_child(child))
+    }
+
+    fn handle_child_pushdown_result(
+        &self,
+        _phase: FilterPushdownPhase,
+        child_pushdown_result: ChildPushdownResult,
+        _config: &datafusion_common::config::ConfigOptions,
+    ) -> Result<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
+        let mut result = FilterPushdownPropagation::if_all(child_pushdown_result);
+        if let Some(updated_child) = result.updated_node {
+            let mut new_self = self.cloned();
+            new_self.input = updated_child;
+            result.updated_node = Some(Arc::new(new_self) as _);
+        }
+        Ok(result)
     }
 }
 
