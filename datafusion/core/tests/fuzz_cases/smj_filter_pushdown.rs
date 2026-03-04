@@ -39,7 +39,7 @@ use datafusion_datasource_parquet::ParquetFormat;
 use datafusion_execution::object_store::ObjectStoreUrl;
 use object_store::memory::InMemory;
 use object_store::path::Path;
-use object_store::{ObjectStore, PutPayload};
+use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 use parquet::arrow::ArrowWriter;
 
 fn left_schema() -> Arc<Schema> {
@@ -270,7 +270,7 @@ async fn test_smj_topk_limit_exceeds_rows() {
 #[tokio::test]
 async fn test_smj_left_join_correctness() {
     // Left join should produce correct results with or without dynamic filters.
-    // No DynamicFilter is pushed through SMJ for non-Inner joins (conservative).
+    // DynamicFilter is pushed through SMJ for any join type that preserves the filtered side.
     run_and_compare(
         "SELECT l.id, l.name, r.dept \
          FROM left_t l LEFT JOIN right_t r ON l.id = r.id \

@@ -486,6 +486,7 @@ fn smj_join(
 /// - Left-side filters are pushed down to the left child
 /// - Right-side filters are pushed down to the right child
 /// - Cross-side filters (referencing both sides) remain as FilterExec
+///
 /// Also tests that non-Inner join types (Left) reject pushdown.
 #[test]
 fn test_static_filter_pushdown_through_sort_merge_join() {
@@ -582,7 +583,7 @@ fn test_static_filter_pushdown_through_sort_merge_join() {
     // The two adjacent FilterExec nodes get collapsed into a single combined predicate.
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), true),
-        @r"
+        @"
     OptimizationTest:
       input:
         - FilterExec: e@4 = ba
@@ -592,9 +593,9 @@ fn test_static_filter_pushdown_through_sort_merge_join() {
         -       DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[d, e, f], file_type=test, pushdown_supported=true
       output:
         Ok:
-          - FilterExec: e@4 = ba AND a@0 = aa
+          - FilterExec: e@4 = ba
           -   SortMergeJoinExec: join_type=Left, on=[(a@0, d@0)]
-          -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true
+          -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true, predicate=a@0 = aa
           -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[d, e, f], file_type=test, pushdown_supported=true
     "
     );
@@ -671,11 +672,11 @@ async fn test_dynamic_filter_pushdown_through_sort_merge_join_with_topk() {
     // The TopK dynamic filter should pass through the SMJ to the right scan
     insta::assert_snapshot!(
         format_plan_for_test(&plan),
-        @r"
+        @"
     - SortExec: TopK(fetch=2), expr=[e@4 ASC], preserve_partitioning=[false]
-    -   SortMergeJoinExec: join_type=Inner, on=[(a@0, d@0)]
-    -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true
-    -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[d, e, f], file_type=test, pushdown_supported=true, predicate=DynamicFilter [ empty ]
+    -   SortMergeJoinExec: join_type=Inner, on=[(a@0, d@0)], left_dynamic_filter=DynamicFilter [ empty ], right_dynamic_filter=DynamicFilter [ empty ]
+    -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true, predicate=DynamicFilter [ empty ]
+    -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[d, e, f], file_type=test, pushdown_supported=true, predicate=DynamicFilter [ empty ] AND DynamicFilter [ empty ]
     "
     );
 
@@ -694,19 +695,72 @@ async fn test_dynamic_filter_pushdown_through_sort_merge_join_with_topk() {
     // After execution, the dynamic filter should be populated with actual bounds
     insta::assert_snapshot!(
         format_plan_for_test(&plan),
-        @r"
+        @"
     - SortExec: TopK(fetch=2), expr=[e@4 ASC], preserve_partitioning=[false], filter=[e@4 IS NULL OR e@4 < bb]
-    -   SortMergeJoinExec: join_type=Inner, on=[(a@0, d@0)]
-    -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true
-    -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[d, e, f], file_type=test, pushdown_supported=true, predicate=DynamicFilter [ e@1 IS NULL OR e@1 < bb ]
+    -   SortMergeJoinExec: join_type=Inner, on=[(a@0, d@0)], left_dynamic_filter=DynamicFilter [ false ], right_dynamic_filter=DynamicFilter [ false ]
+    -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true, predicate=DynamicFilter [ false ]
+    -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[d, e, f], file_type=test, pushdown_supported=true, predicate=DynamicFilter [ false ] AND DynamicFilter [ e@1 IS NULL OR e@1 < bb ]
     "
     );
 }
 
-/// Tests filter pushdown for all non-Inner join types to ensure they correctly
-/// reject pushdown (conservative behavior).
+/// Tests filter pushdown for Full join to ensure it correctly rejects pushdown.
 #[test]
-fn test_smj_filter_pushdown_non_inner_unsupported() {
+fn test_smj_filter_pushdown_unsupported() {
+    use datafusion_common::JoinType;
+
+    let left_schema = Arc::new(Schema::new(vec![
+        Field::new("a", DataType::Utf8, false),
+        Field::new("b", DataType::Utf8, false),
+    ]));
+    let right_schema = Arc::new(Schema::new(vec![
+        Field::new("c", DataType::Utf8, false),
+        Field::new("d", DataType::Utf8, false),
+    ]));
+
+    {
+        let join_type = JoinType::Full;
+        let left_scan = TestScanBuilder::new(Arc::clone(&left_schema))
+            .with_support(true)
+            .build();
+        let right_scan = TestScanBuilder::new(Arc::clone(&right_schema))
+            .with_support(true)
+            .build();
+        let on = vec![(
+            col("a", &left_schema).unwrap(),
+            col("c", &right_schema).unwrap(),
+        )];
+        let join = smj_join(left_scan, right_scan, on, join_type);
+
+        let join_schema = join.schema();
+        let filter_pred = col_lit_predicate("a", "x", &join_schema);
+        let plan = Arc::new(FilterExec::try_new(filter_pred, join).unwrap())
+            as Arc<dyn ExecutionPlan>;
+
+        let result = OptimizationTest::new(plan, FilterPushdown::new(), true);
+        let full_output = format!("{result}");
+        let output = full_output
+            .split("output:")
+            .nth(1)
+            .expect("Expected output section in result");
+
+        // The filter should remain as a FilterExec (not pushed into the scan)
+        assert!(
+            output.contains("FilterExec"),
+            "Expected FilterExec to remain for {join_type:?} join, got:\n{full_output}"
+        );
+        // The scan should NOT have a predicate
+        assert!(
+            !output.contains("predicate="),
+            "Expected no predicate pushdown for {join_type:?} join, got:\n{full_output}"
+        );
+    }
+}
+
+/// Tests filter pushdown for other non-Inner join types to ensure they correctly
+/// support pushdown for their preserved side.
+#[test]
+fn test_smj_filter_pushdown_supported() {
     use datafusion_common::JoinType;
 
     let left_schema = Arc::new(Schema::new(vec![
@@ -722,7 +776,6 @@ fn test_smj_filter_pushdown_non_inner_unsupported() {
     for join_type in [
         JoinType::Left,
         JoinType::Right,
-        JoinType::Full,
         JoinType::LeftSemi,
         JoinType::LeftAnti,
         JoinType::RightSemi,
@@ -744,7 +797,7 @@ fn test_smj_filter_pushdown_non_inner_unsupported() {
         // Pick a column from the join output; for semi/anti joins only
         // one side's columns are present
         let filter_col = match join_type {
-            JoinType::RightSemi | JoinType::RightAnti => "c",
+            JoinType::RightSemi | JoinType::RightAnti | JoinType::Right => "c",
             _ => "a",
         };
         let filter_pred = col_lit_predicate(filter_col, "x", &join_schema);
@@ -752,16 +805,21 @@ fn test_smj_filter_pushdown_non_inner_unsupported() {
             as Arc<dyn ExecutionPlan>;
 
         let result = OptimizationTest::new(plan, FilterPushdown::new(), true);
-        let output = format!("{result}");
-        // The filter should remain as a FilterExec (not pushed into the scan)
+        let full_output = format!("{result}");
+        let output = full_output
+            .split("output:")
+            .nth(1)
+            .expect("Expected output section in result");
+
+        // The filter should NOT remain as a FilterExec (pushed into the scan)
         assert!(
-            output.contains("FilterExec"),
-            "Expected FilterExec to remain for {join_type:?} join, got:\n{output}"
+            !output.contains("FilterExec"),
+            "Expected FilterExec to be pushed for {join_type:?} join, got:\n{full_output}"
         );
-        // The scan should NOT have a predicate
+        // The scan should HAVE a predicate
         assert!(
-            !output.contains("predicate="),
-            "Expected no predicate pushdown for {join_type:?} join, got:\n{output}"
+            output.contains("predicate="),
+            "Expected predicate pushdown for {join_type:?} join, got:\n{full_output}"
         );
     }
 }
