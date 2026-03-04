@@ -223,6 +223,125 @@ async fn test_sort_merge_join_dynamic_filter_progressive_tightening() -> Result<
 
     Ok(())
 }
+
+#[tokio::test]
+async fn test_sort_merge_join_dynamic_filter_consensus() -> Result<()> {
+    // Partition 0: advances fast (10, 20, 30)
+    // Partition 1: advances slow (15, 16, 17)
+    let batch_left_p0 = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("a1", DataType::Int32, false)])),
+        vec![Arc::new(Int32Array::from(vec![10, 20, 30]))],
+    )?;
+    let batch_left_p1 = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("a1", DataType::Int32, false)])),
+        vec![Arc::new(Int32Array::from(vec![15, 16, 17]))],
+    )?;
+    let schema_left = batch_left_p0.schema();
+    let left = TestMemoryExec::try_new_exec(
+        &[vec![batch_left_p0], vec![batch_left_p1]],
+        schema_left,
+        None,
+    )?;
+
+    // Right side: matching values for both partitions
+    let batch_right_p0 = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("a2", DataType::Int32, false)])),
+        vec![Arc::new(Int32Array::from(vec![10, 20, 30]))],
+    )?;
+    let batch_right_p1 = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("a2", DataType::Int32, false)])),
+        vec![Arc::new(Int32Array::from(vec![15, 16, 17]))],
+    )?;
+    let schema_right = batch_right_p0.schema();
+    let right = TestMemoryExec::try_new_exec(
+        &[vec![batch_right_p0], vec![batch_right_p1]],
+        schema_right,
+        None,
+    )?;
+
+    let on = vec![(
+        Arc::new(Column::new("a1", 0)) as _,
+        Arc::new(Column::new("a2", 0)) as _,
+    )];
+
+    let join = SortMergeJoinExec::try_new(
+        left,
+        right,
+        on.clone(),
+        None,
+        Inner,
+        vec![SortOptions::default()],
+        NullEquality::NullEqualsNothing,
+    )?;
+
+    let right_filter_expr =
+        SortMergeJoinExec::create_dynamic_filter(&on, JoinSide::Right);
+    let right_filter_clone = Arc::clone(&right_filter_expr);
+
+    let join = join.with_right_dynamic_filter(right_filter_expr);
+
+    let config = SessionConfig::new().with_batch_size(1);
+    let context = Arc::new(TaskContext::default().with_session_config(config));
+
+    // Execute both partitions
+    let mut stream0 = join.execute(0, Arc::clone(&context))?;
+    let mut stream1 = join.execute(1, Arc::clone(&context))?;
+
+    // 1. Initial polls:
+    // P0 reads 10. Filter is still empty because P1 hasn't reported.
+    let _ = stream0.next().await.transpose()?;
+    assert_eq!(format!("{}", right_filter_clone), "DynamicFilter [ empty ]");
+
+    // P1 reads 15. Filter publishes min(10, 15) = 10.
+    let _ = stream1.next().await.transpose()?;
+    assert_eq!(
+        format!("{}", right_filter_clone),
+        "DynamicFilter [ a2@0 >= 10 ]"
+    );
+
+    // 2. Advance P0 to 20.
+    // Filter remains 10 because P1 is still at 15. min(20, 15) = 10 (incorrect, wait)
+    // Wait, the logic is: min(all current heads).
+    // If P0 is at 20 and P1 is at 15, the global min is 15.
+    let _ = stream0.next().await.transpose()?;
+    assert_eq!(
+        format!("{}", right_filter_clone),
+        "DynamicFilter [ a2@0 >= 15 ]"
+    );
+
+    // 3. Advance P0 to 30.
+    // Filter remains 15 because P1 is still at 15.
+    let _ = stream0.next().await.transpose()?;
+    assert_eq!(
+        format!("{}", right_filter_clone),
+        "DynamicFilter [ a2@0 >= 15 ]"
+    );
+
+    // 4. Advance P1 to 16.
+    // Global min becomes 16.
+    let _ = stream1.next().await.transpose()?;
+    assert_eq!(
+        format!("{}", right_filter_clone),
+        "DynamicFilter [ a2@0 >= 16 ]"
+    );
+
+    // 5. Exhaust P1.
+    // P1 was at 17 (last row).
+    let _ = stream1.next().await.transpose()?; // P1 reads 17
+    assert_eq!(
+        format!("{}", right_filter_clone),
+        "DynamicFilter [ a2@0 >= 17 ]"
+    );
+
+    let _ = stream1.next().await.transpose()?; // P1 exhausted
+    // P1 is now removed from consensus. Filter uses P0's current head: 30.
+    assert_eq!(
+        format!("{}", right_filter_clone),
+        "DynamicFilter [ a2@0 >= 30 ]"
+    );
+
+    Ok(())
+}
 fn build_table_from_batches(batches: Vec<RecordBatch>) -> Arc<dyn ExecutionPlan> {
     let schema = batches.first().unwrap().schema();
     TestMemoryExec::try_new_exec(&[batches], schema, None).unwrap()

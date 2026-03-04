@@ -33,19 +33,23 @@ use std::sync::Arc;
 /// of all current partition heads.
 #[derive(Debug)]
 pub(crate) struct SharedSortMergeBoundsAccumulator {
-    /// Current head values for each partition.
-    /// Index corresponds to the partition ID.
-    heads: Mutex<Vec<Option<ScalarValue>>>,
-    /// Whether each partition is exhausted.
-    exhausted: Mutex<Vec<bool>>,
+    /// Shared state for all partitions.
+    state: Mutex<AccumulatorState>,
     /// Dynamic filter to update.
     dynamic_filter: Arc<DynamicFilterPhysicalExpr>,
-    /// Number of partitions to wait for.
-    num_partitions: usize,
     /// Sort options of the join key.
     sort_options: SortOptions,
     /// Join key expression on the side being filtered.
     on_expr: PhysicalExprRef,
+}
+
+#[derive(Debug)]
+struct AccumulatorState {
+    /// Current head values for each partition.
+    /// Index corresponds to the partition ID.
+    heads: Vec<Option<ScalarValue>>,
+    /// Whether each partition is exhausted.
+    exhausted: Vec<bool>,
 }
 
 impl SharedSortMergeBoundsAccumulator {
@@ -56,10 +60,11 @@ impl SharedSortMergeBoundsAccumulator {
         dynamic_filter: Arc<DynamicFilterPhysicalExpr>,
     ) -> Self {
         Self {
-            heads: Mutex::new(vec![None; num_partitions]),
-            exhausted: Mutex::new(vec![false; num_partitions]),
+            state: Mutex::new(AccumulatorState {
+                heads: vec![None; num_partitions],
+                exhausted: vec![false; num_partitions],
+            }),
             dynamic_filter,
-            num_partitions,
             sort_options,
             on_expr,
         }
@@ -67,35 +72,32 @@ impl SharedSortMergeBoundsAccumulator {
 
     /// Report current head value from a partition.
     pub fn report_head(&self, partition_id: usize, head: ScalarValue) -> Result<()> {
-        let mut heads = self.heads.lock();
-        heads[partition_id] = Some(head);
+        let mut state = self.state.lock();
+        state.heads[partition_id] = Some(head);
 
-        self.update_filter(&heads)
+        self.update_filter(&state)
     }
 
     /// Mark a partition as exhausted.
     pub fn mark_exhausted(&self, partition_id: usize) -> Result<()> {
-        let mut exhausted = self.exhausted.lock();
-        exhausted[partition_id] = true;
+        let mut state = self.state.lock();
+        state.exhausted[partition_id] = true;
 
         // If all partitions are exhausted, we can mark the filter as complete.
-        if exhausted.iter().all(|&e| e) {
+        if state.exhausted.iter().all(|&e| e) {
             self.dynamic_filter.mark_complete();
             return Ok(());
         }
 
-        let heads = self.heads.lock();
-        self.update_filter(&heads)
+        self.update_filter(&state)
     }
 
     /// Update the dynamic filter based on current heads.
-    fn update_filter(&self, heads: &[Option<ScalarValue>]) -> Result<()> {
-        let exhausted = self.exhausted.lock();
-
+    fn update_filter(&self, state: &AccumulatorState) -> Result<()> {
         // We only publish a bound if all non-exhausted partitions have reported a head.
         let mut active_heads = Vec::new();
-        for (i, head) in heads.iter().enumerate() {
-            if !exhausted[i] {
+        for (i, head) in state.heads.iter().enumerate() {
+            if !state.exhausted[i] {
                 if let Some(h) = head {
                     active_heads.push(h);
                 } else {
