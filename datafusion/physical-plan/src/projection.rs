@@ -430,7 +430,13 @@ impl ExecutionPlan for ProjectionExec {
         child_pushdown_result: ChildPushdownResult,
         _config: &ConfigOptions,
     ) -> Result<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
-        Ok(FilterPushdownPropagation::if_all(child_pushdown_result))
+        let mut result = FilterPushdownPropagation::if_all(child_pushdown_result);
+        if let Some(updated_child) = result.updated_node {
+            let mut new_self = self.clone();
+            new_self.input = updated_child;
+            result.updated_node = Some(Arc::new(new_self) as _);
+        }
+        Ok(result)
     }
 
     fn try_pushdown_sort(

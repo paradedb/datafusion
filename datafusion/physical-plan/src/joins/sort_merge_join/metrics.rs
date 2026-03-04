@@ -37,6 +37,8 @@ pub(super) struct SortMergeJoinMetrics {
     peak_mem_used: Gauge,
     /// Metrics related to spilling
     spill_metrics: SpillMetrics,
+    /// Number of times the dynamic filter was tightened
+    dynamic_filter_updates: Count,
 }
 
 impl SortMergeJoinMetrics {
@@ -47,6 +49,8 @@ impl SortMergeJoinMetrics {
         let input_rows = MetricBuilder::new(metrics).counter("input_rows", partition);
         let peak_mem_used = MetricBuilder::new(metrics).gauge("peak_mem_used", partition);
         let spill_metrics = SpillMetrics::new(metrics, partition);
+        let dynamic_filter_updates =
+            MetricBuilder::new(metrics).counter("dynamic_filter_updates", partition);
 
         let baseline_metrics = BaselineMetrics::new(metrics, partition);
 
@@ -57,6 +61,7 @@ impl SortMergeJoinMetrics {
             baseline_metrics,
             peak_mem_used,
             spill_metrics,
+            dynamic_filter_updates,
         }
     }
 
@@ -82,5 +87,9 @@ impl SortMergeJoinMetrics {
 
     pub fn spill_metrics(&self) -> SpillMetrics {
         self.spill_metrics.clone()
+    }
+
+    pub fn dynamic_filter_updates(&self) -> Count {
+        self.dynamic_filter_updates.clone()
     }
 }
