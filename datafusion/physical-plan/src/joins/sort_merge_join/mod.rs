@@ -21,6 +21,7 @@ pub use exec::SortMergeJoinExec;
 
 mod exec;
 mod metrics;
+mod shared_bounds;
 mod stream;
 
 #[cfg(test)]

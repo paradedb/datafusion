@@ -34,6 +34,7 @@ use std::sync::atomic::Ordering::Relaxed;
 use std::task::{Context, Poll};
 
 use crate::joins::sort_merge_join::metrics::SortMergeJoinMetrics;
+use crate::joins::sort_merge_join::shared_bounds::SharedSortMergeBoundsAccumulator;
 use crate::joins::utils::{JoinFilter, compare_join_arrays};
 use crate::metrics::RecordOutput;
 use crate::spill::spill_manager::SpillManager;
@@ -49,8 +50,8 @@ use arrow::error::ArrowError;
 use arrow::ipc::reader::StreamReader;
 use datafusion_common::config::SpillCompression;
 use datafusion_common::{
-    DataFusionError, HashSet, JoinSide, JoinType, NullEquality, Result, exec_err,
-    internal_err, not_impl_err,
+    DataFusionError, HashSet, JoinSide, JoinType, NullEquality, Result, ScalarValue,
+    exec_err, internal_err, not_impl_err,
 };
 use datafusion_execution::disk_manager::RefCountedTempFile;
 use datafusion_execution::memory_pool::MemoryReservation;
@@ -202,6 +203,16 @@ impl StreamedBatch {
             current_chunk.buffered_indices.append_null();
         }
     }
+
+    /// Returns the first join key value in this batch
+    fn first_join_key(&self) -> Option<ScalarValue> {
+        if self.batch.num_rows() == 0 {
+            return None;
+        }
+        self.join_arrays
+            .first()
+            .and_then(|arr| ScalarValue::try_from_array(arr, 0).ok())
+    }
 }
 
 /// A buffered batch that contains contiguous rows with same join key
@@ -263,6 +274,16 @@ impl BufferedBatch {
             join_filter_not_matched_map: HashMap::new(),
             num_rows,
         }
+    }
+
+    /// Returns the first join key value in this batch
+    fn first_join_key(&self) -> Option<ScalarValue> {
+        if self.num_rows == 0 {
+            return None;
+        }
+        self.join_arrays
+            .first()
+            .and_then(|arr| ScalarValue::try_from_array(arr, 0).ok())
     }
 }
 
@@ -347,6 +368,17 @@ pub(super) struct SortMergeJoinStream {
     pub current_ordering: Ordering,
     /// Manages the process of spilling and reading back intermediate data
     pub spill_manager: SpillManager,
+
+    // ========================================================================
+    // DYNAMIC FILTER FIELDS:
+    // These fields manage dynamic filter pushdown.
+    // ========================================================================
+    /// Dynamic filter for the streamed side
+    pub streamed_dynamic_filter: Option<Arc<SharedSortMergeBoundsAccumulator>>,
+    /// Dynamic filter for the buffered side
+    pub buffered_dynamic_filter: Option<Arc<SharedSortMergeBoundsAccumulator>>,
+    /// Partition ID of this stream
+    pub partition_id: usize,
 
     // ========================================================================
     // EXECUTION RESOURCES:
@@ -944,6 +976,9 @@ impl SortMergeJoinStream {
         join_metrics: SortMergeJoinMetrics,
         reservation: MemoryReservation,
         runtime_env: Arc<RuntimeEnv>,
+        streamed_dynamic_filter: Option<Arc<SharedSortMergeBoundsAccumulator>>,
+        buffered_dynamic_filter: Option<Arc<SharedSortMergeBoundsAccumulator>>,
+        partition_id: usize,
     ) -> Result<Self> {
         let streamed_schema = streamed.schema();
         let buffered_schema = buffered.schema();
@@ -988,6 +1023,9 @@ impl SortMergeJoinStream {
             runtime_env,
             spill_manager,
             streamed_batch_counter: AtomicUsize::new(0),
+            streamed_dynamic_filter,
+            buffered_dynamic_filter,
+            partition_id,
         })
     }
 
@@ -1064,6 +1102,9 @@ impl SortMergeJoinStream {
                     }
                     Poll::Ready(None) => {
                         self.streamed_state = StreamedState::Exhausted;
+                        if let Some(accumulator) = &self.buffered_dynamic_filter {
+                            accumulator.mark_exhausted(self.partition_id)?;
+                        }
                     }
                     Poll::Ready(Some(batch)) => {
                         if batch.num_rows() > 0 {
@@ -1072,6 +1113,14 @@ impl SortMergeJoinStream {
                             self.join_metrics.input_rows().add(batch.num_rows());
                             self.streamed_batch =
                                 StreamedBatch::new(batch, &self.on_streamed);
+
+                            // Report first join key to the BUFFERED side's dynamic filter
+                            if let Some(accumulator) = &self.buffered_dynamic_filter {
+                                if let Some(key) = self.streamed_batch.first_join_key() {
+                                    accumulator.report_head(self.partition_id, key)?;
+                                }
+                            }
+
                             // Every incoming streaming batch should have its unique id
                             // Check `JoinedRecordBatches.self.streamed_batch_counter` documentation
                             self.streamed_batch_counter
@@ -1171,6 +1220,9 @@ impl SortMergeJoinStream {
                     }
                     Poll::Ready(None) => {
                         self.buffered_state = BufferedState::Exhausted;
+                        if let Some(accumulator) = &self.streamed_dynamic_filter {
+                            accumulator.mark_exhausted(self.partition_id)?;
+                        }
                         return Poll::Ready(None);
                     }
                     Poll::Ready(Some(batch)) => {
@@ -1180,6 +1232,13 @@ impl SortMergeJoinStream {
                         if batch.num_rows() > 0 {
                             let buffered_batch =
                                 BufferedBatch::new(batch, 0..1, &self.on_buffered);
+
+                            // Report first join key to the STREAMED side's dynamic filter
+                            if let Some(accumulator) = &self.streamed_dynamic_filter {
+                                if let Some(key) = buffered_batch.first_join_key() {
+                                    accumulator.report_head(self.partition_id, key)?;
+                                }
+                            }
 
                             self.allocate_reservation(buffered_batch)?;
                             self.buffered_state = BufferedState::PollingRest;
@@ -1212,6 +1271,9 @@ impl SortMergeJoinStream {
                             }
                             Poll::Ready(None) => {
                                 self.buffered_state = BufferedState::Ready;
+                                if let Some(accumulator) = &self.streamed_dynamic_filter {
+                                    accumulator.mark_exhausted(self.partition_id)?;
+                                }
                             }
                             Poll::Ready(Some(batch)) => {
                                 // Polling batches coming concurrently as multiple partitions
@@ -1223,6 +1285,18 @@ impl SortMergeJoinStream {
                                         0..0,
                                         &self.on_buffered,
                                     );
+
+                                    // Report first join key to the STREAMED side's dynamic filter
+                                    if let Some(accumulator) =
+                                        &self.streamed_dynamic_filter
+                                    {
+                                        if let Some(key) = buffered_batch.first_join_key()
+                                        {
+                                            accumulator
+                                                .report_head(self.partition_id, key)?;
+                                        }
+                                    }
+
                                     self.allocate_reservation(buffered_batch)?;
                                 }
                             }

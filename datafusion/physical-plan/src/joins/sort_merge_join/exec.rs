@@ -21,8 +21,8 @@
 
 use std::any::Any;
 use std::collections::HashSet;
-use std::fmt::Formatter;
-use std::sync::Arc;
+use std::fmt::{Debug, Formatter};
+use std::sync::{Arc, OnceLock};
 
 use crate::execution_plan::{EmissionType, boundedness_from_children};
 use crate::expressions::PhysicalSortExpr;
@@ -31,6 +31,7 @@ use crate::filter_pushdown::{
     FilterPushdownPropagation,
 };
 use crate::joins::sort_merge_join::metrics::SortMergeJoinMetrics;
+use crate::joins::sort_merge_join::shared_bounds::SharedSortMergeBoundsAccumulator;
 use crate::joins::sort_merge_join::stream::SortMergeJoinStream;
 use crate::joins::utils::{
     JoinFilter, JoinOn, JoinOnRef, build_join_schema, check_join_is_valid,
@@ -57,7 +58,10 @@ use datafusion_common::{
 use datafusion_execution::TaskContext;
 use datafusion_execution::memory_pool::MemoryConsumer;
 use datafusion_physical_expr::equivalence::join_equivalence_properties;
-use datafusion_physical_expr_common::physical_expr::{PhysicalExpr, PhysicalExprRef, fmt_sql};
+use datafusion_physical_expr::expressions::{DynamicFilterPhysicalExpr, lit};
+use datafusion_physical_expr_common::physical_expr::{
+    PhysicalExpr, PhysicalExprRef, fmt_sql,
+};
 use datafusion_physical_expr_common::sort_expr::{LexOrdering, OrderingRequirements};
 
 /// Join execution plan that executes equi-join predicates on multiple partitions using Sort-Merge
@@ -134,6 +138,27 @@ pub struct SortMergeJoinExec {
     pub null_equality: NullEquality,
     /// Cache holding plan properties like equivalences, output partitioning etc.
     cache: PlanProperties,
+    /// Dynamic filter for the left side
+    left_dynamic_filter: Option<SortMergeJoinExecDynamicFilter>,
+    /// Dynamic filter for the right side
+    right_dynamic_filter: Option<SortMergeJoinExecDynamicFilter>,
+}
+
+#[derive(Clone)]
+struct SortMergeJoinExecDynamicFilter {
+    /// Dynamic filter that we'll update with the results of the other side.
+    filter: Arc<DynamicFilterPhysicalExpr>,
+    /// Shared bounds accumulator to collect information from each partition.
+    /// It is lazily initialized during execution.
+    accumulator: Arc<OnceLock<Arc<SharedSortMergeBoundsAccumulator>>>,
+}
+
+impl Debug for SortMergeJoinExecDynamicFilter {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SortMergeJoinExecDynamicFilter")
+            .field("filter", &self.filter)
+            .finish()
+    }
 }
 
 impl SortMergeJoinExec {
@@ -205,7 +230,55 @@ impl SortMergeJoinExec {
             sort_options,
             null_equality,
             cache,
+            left_dynamic_filter: None,
+            right_dynamic_filter: None,
         })
+    }
+
+    fn allow_join_dynamic_filter_pushdown(&self, config: &ConfigOptions) -> bool {
+        if !matches!(
+            self.join_type,
+            JoinType::Inner | JoinType::LeftSemi | JoinType::RightSemi
+        ) || !config.optimizer.enable_join_dynamic_filter_pushdown
+        {
+            return false;
+        }
+
+        true
+    }
+
+    pub(crate) fn create_dynamic_filter(
+        on: &JoinOn,
+        side: JoinSide,
+    ) -> Arc<DynamicFilterPhysicalExpr> {
+        let keys = match side {
+            JoinSide::Left => on.iter().map(|(l, _)| Arc::clone(l)).collect::<Vec<_>>(),
+            JoinSide::Right => on.iter().map(|(_, r)| Arc::clone(r)).collect::<Vec<_>>(),
+            JoinSide::None => vec![],
+        };
+        Arc::new(DynamicFilterPhysicalExpr::new(keys, lit(true)))
+    }
+
+    pub fn with_left_dynamic_filter(
+        mut self,
+        dynamic_filter: Arc<DynamicFilterPhysicalExpr>,
+    ) -> Self {
+        self.left_dynamic_filter = Some(SortMergeJoinExecDynamicFilter {
+            filter: dynamic_filter,
+            accumulator: Arc::new(OnceLock::new()),
+        });
+        self
+    }
+
+    pub fn with_right_dynamic_filter(
+        mut self,
+        dynamic_filter: Arc<DynamicFilterPhysicalExpr>,
+    ) -> Self {
+        self.right_dynamic_filter = Some(SortMergeJoinExecDynamicFilter {
+            filter: dynamic_filter,
+            accumulator: Arc::new(OnceLock::new()),
+        });
+        self
     }
 
     /// Get probe side (e.g streaming side) information for this sort merge join.
@@ -447,15 +520,20 @@ impl ExecutionPlan for SortMergeJoinExec {
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         match &children[..] {
-            [left, right] => Ok(Arc::new(SortMergeJoinExec::try_new(
-                Arc::clone(left),
-                Arc::clone(right),
-                self.on.clone(),
-                self.filter.clone(),
-                self.join_type,
-                self.sort_options.clone(),
-                self.null_equality,
-            )?)),
+            [left, right] => {
+                let mut node = SortMergeJoinExec::try_new(
+                    Arc::clone(left),
+                    Arc::clone(right),
+                    self.on.clone(),
+                    self.filter.clone(),
+                    self.join_type,
+                    self.sort_options.clone(),
+                    self.null_equality,
+                )?;
+                node.left_dynamic_filter = self.left_dynamic_filter.clone();
+                node.right_dynamic_filter = self.right_dynamic_filter.clone();
+                Ok(Arc::new(node))
+            }
             _ => internal_err!("SortMergeJoin wrong number of children"),
         }
     }
@@ -473,22 +551,54 @@ impl ExecutionPlan for SortMergeJoinExec {
             "Invalid SortMergeJoinExec, partition count mismatch {left_partitions}!={right_partitions},\
                  consider using RepartitionExec"
         );
-        let (on_left, on_right) = self.on.iter().cloned().unzip();
+        let (on_left, on_right): (Vec<_>, Vec<_>) = self.on.iter().cloned().unzip();
         let (streamed, buffered, on_streamed, on_buffered) =
             if SortMergeJoinExec::probe_side(&self.join_type) == JoinSide::Left {
                 (
                     Arc::clone(&self.left),
                     Arc::clone(&self.right),
-                    on_left,
-                    on_right,
+                    on_left.clone(),
+                    on_right.clone(),
                 )
             } else {
                 (
                     Arc::clone(&self.right),
                     Arc::clone(&self.left),
-                    on_right,
-                    on_left,
+                    on_right.clone(),
+                    on_left.clone(),
                 )
+            };
+
+        // Initialize dynamic filters if they exist
+        let left_dynamic_filter = self.left_dynamic_filter.as_ref().map(|f| {
+            let accumulator = f.accumulator.get_or_init(|| {
+                Arc::new(SharedSortMergeBoundsAccumulator::new(
+                    left_partitions,
+                    self.sort_options[0],
+                    Arc::clone(&on_left[0]),
+                    Arc::clone(&f.filter),
+                ))
+            });
+            Arc::clone(accumulator)
+        });
+
+        let right_dynamic_filter = self.right_dynamic_filter.as_ref().map(|f| {
+            let accumulator = f.accumulator.get_or_init(|| {
+                Arc::new(SharedSortMergeBoundsAccumulator::new(
+                    right_partitions,
+                    self.sort_options[0],
+                    Arc::clone(&on_right[0]),
+                    Arc::clone(&f.filter),
+                ))
+            });
+            Arc::clone(accumulator)
+        });
+
+        let (streamed_dynamic_filter, buffered_dynamic_filter) =
+            if SortMergeJoinExec::probe_side(&self.join_type) == JoinSide::Left {
+                (left_dynamic_filter, right_dynamic_filter)
+            } else {
+                (right_dynamic_filter, left_dynamic_filter)
             };
 
         // execute children plans
@@ -518,6 +628,9 @@ impl ExecutionPlan for SortMergeJoinExec {
             SortMergeJoinMetrics::new(partition, &self.metrics),
             reservation,
             context.runtime_env(),
+            streamed_dynamic_filter,
+            buffered_dynamic_filter,
+            partition,
         )?))
     }
 
@@ -590,7 +703,7 @@ impl ExecutionPlan for SortMergeJoinExec {
             self.children()[1],
         )?;
 
-        Ok(Some(Arc::new(SortMergeJoinExec::try_new(
+        let mut node = SortMergeJoinExec::try_new(
             Arc::new(new_left),
             Arc::new(new_right),
             new_on,
@@ -598,46 +711,70 @@ impl ExecutionPlan for SortMergeJoinExec {
             self.join_type,
             self.sort_options.clone(),
             self.null_equality,
-        )?)))
+        )?;
+        node.left_dynamic_filter = self.left_dynamic_filter.clone();
+        node.right_dynamic_filter = self.right_dynamic_filter.clone();
+        Ok(Some(Arc::new(node)))
     }
 
     fn gather_filters_for_pushdown(
         &self,
-        _phase: FilterPushdownPhase,
+        phase: FilterPushdownPhase,
         parent_filters: Vec<Arc<dyn PhysicalExpr>>,
-        _config: &ConfigOptions,
+        config: &ConfigOptions,
     ) -> Result<FilterDescription> {
-        // Only support Inner joins for now — other join types have complex
-        // column routing semantics (e.g. nullable sides, semi/anti output
-        // restrictions) that require careful handling.
-        if self.join_type != JoinType::Inner {
-            return Ok(FilterDescription::all_unsupported(
-                &parent_filters,
-                &self.children(),
-            ));
-        }
+        let (left_preserved, right_preserved) = match self.join_type {
+            JoinType::Inner => (true, true),
+            JoinType::Left => (true, false),
+            JoinType::Right => (false, true),
+            JoinType::Full => (false, false),
+            JoinType::LeftSemi | JoinType::LeftAnti | JoinType::LeftMark => (true, false),
+            JoinType::RightSemi | JoinType::RightAnti | JoinType::RightMark => {
+                (false, true)
+            }
+        };
 
-        // For Inner joins, the output schema is [left_cols..., right_cols...].
-        // Build allowed index sets for each side so that
-        // `from_child_with_allowed_indices` can route each parent filter to
-        // the correct child based on column references.
         let left_col_count = self.left.schema().fields().len();
         let total_col_count = self.schema.fields().len();
 
         let left_allowed: HashSet<usize> = (0..left_col_count).collect();
         let right_allowed: HashSet<usize> = (left_col_count..total_col_count).collect();
 
-        let left_child = ChildFilterDescription::from_child_with_allowed_indices(
-            &parent_filters,
-            left_allowed,
-            &self.left,
-        )?;
+        let mut left_child = if left_preserved {
+            ChildFilterDescription::from_child_with_allowed_indices(
+                &parent_filters,
+                left_allowed,
+                &self.left,
+            )?
+        } else {
+            ChildFilterDescription::all_unsupported(&parent_filters)
+        };
 
-        let right_child = ChildFilterDescription::from_child_with_allowed_indices(
-            &parent_filters,
-            right_allowed,
-            &self.right,
-        )?;
+        let mut right_child = if right_preserved {
+            ChildFilterDescription::from_child_with_allowed_indices(
+                &parent_filters,
+                right_allowed,
+                &self.right,
+            )?
+        } else {
+            ChildFilterDescription::all_unsupported(&parent_filters)
+        };
+
+        // Add dynamic filters in Post phase if enabled
+        if matches!(phase, FilterPushdownPhase::Post)
+            && self.allow_join_dynamic_filter_pushdown(config)
+        {
+            if left_preserved {
+                let dynamic_filter =
+                    Self::create_dynamic_filter(&self.on, JoinSide::Left);
+                left_child = left_child.with_self_filter(dynamic_filter);
+            }
+            if right_preserved {
+                let dynamic_filter =
+                    Self::create_dynamic_filter(&self.on, JoinSide::Right);
+                right_child = right_child.with_self_filter(dynamic_filter);
+            }
+        }
 
         Ok(FilterDescription::new()
             .with_child(left_child)
@@ -650,6 +787,33 @@ impl ExecutionPlan for SortMergeJoinExec {
         child_pushdown_result: ChildPushdownResult,
         _config: &ConfigOptions,
     ) -> Result<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
-        Ok(FilterPushdownPropagation::if_any(child_pushdown_result))
+        let mut result = FilterPushdownPropagation::if_any(child_pushdown_result.clone());
+        assert_eq!(child_pushdown_result.self_filters.len(), 2);
+
+        let left_child_self_filters = &child_pushdown_result.self_filters[0];
+        let right_child_self_filters = &child_pushdown_result.self_filters[1];
+
+        let mut node = (*self).clone();
+
+        if let Some(filter) = left_child_self_filters.first() {
+            let predicate = Arc::clone(&filter.predicate);
+            if let Ok(dynamic_filter) =
+                Arc::downcast::<DynamicFilterPhysicalExpr>(predicate)
+            {
+                node = node.with_left_dynamic_filter(dynamic_filter);
+            }
+        }
+
+        if let Some(filter) = right_child_self_filters.first() {
+            let predicate = Arc::clone(&filter.predicate);
+            if let Ok(dynamic_filter) =
+                Arc::downcast::<DynamicFilterPhysicalExpr>(predicate)
+            {
+                node = node.with_right_dynamic_filter(dynamic_filter);
+            }
+        }
+
+        result.updated_node = Some(Arc::new(node) as _);
+        Ok(result)
     }
 }
