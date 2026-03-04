@@ -83,21 +83,24 @@ impl SharedSortMergeBoundsAccumulator {
         let mut state = self.state.lock();
         state.exhausted[partition_id] = true;
 
+        self.update_filter(&state)?;
+
         // If all partitions are exhausted, we can mark the filter as complete.
         if state.exhausted.iter().all(|&e| e) {
             self.dynamic_filter.mark_complete();
-            return Ok(());
         }
 
-        self.update_filter(&state)
+        Ok(())
     }
 
     /// Update the dynamic filter based on current heads.
     fn update_filter(&self, state: &AccumulatorState) -> Result<()> {
         // We only publish a bound if all non-exhausted partitions have reported a head.
         let mut active_heads = Vec::new();
+        let mut any_active = false;
         for (i, head) in state.heads.iter().enumerate() {
             if !state.exhausted[i] {
+                any_active = true;
                 if let Some(h) = head {
                     active_heads.push(h);
                 } else {
@@ -107,9 +110,16 @@ impl SharedSortMergeBoundsAccumulator {
             }
         }
 
+        if !any_active {
+            // All partitions exhausted: sudden death.
+            // No more matches are possible, so we can prune everything.
+            return self.dynamic_filter.update(lit(false));
+        }
+
         if active_heads.is_empty() {
-            // All partitions exhausted, but mark_exhausted already handles this.
-            return Ok(());
+            // This case is reachable if all partitions were marked exhausted
+            // without ever reporting a head (e.g. empty inputs).
+            return self.dynamic_filter.update(lit(false));
         }
 
         // Calculate the consensus bound.

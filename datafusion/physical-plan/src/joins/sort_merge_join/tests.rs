@@ -80,7 +80,7 @@ async fn test_sort_merge_join_dynamic_filter_initial_bound() -> Result<()> {
         ("c1", &vec![7, 8, 9]),
     );
     let right = build_table(
-        ("a2", &vec![15, 25, 35]),
+        ("a2", &vec![10, 25, 35]),
         ("b2", &vec![4, 5, 6]),
         ("c2", &vec![7, 8, 9]),
     );
@@ -112,7 +112,8 @@ async fn test_sort_merge_join_dynamic_filter_initial_bound() -> Result<()> {
         .with_left_dynamic_filter(left_filter_expr)
         .with_right_dynamic_filter(right_filter_expr);
 
-    let context = TaskContext::default();
+    let config = SessionConfig::new().with_batch_size(1);
+    let context = TaskContext::default().with_session_config(config);
     let mut stream = join.execute(0, Arc::new(context))?;
 
     // Before polling, filters should be empty
@@ -124,10 +125,10 @@ async fn test_sort_merge_join_dynamic_filter_initial_bound() -> Result<()> {
 
     // After polling, both sides should have reported their first values.
     // Left side first value: 10 -> Right side filter: a2@0 >= 10
-    // Right side first value: 15 -> Left side filter: a1@0 >= 15
+    // Right side first value: 10 -> Left side filter: a1@0 >= 10
     assert_eq!(
         format!("{}", left_filter_clone),
-        "DynamicFilter [ a1@0 >= 15 ]"
+        "DynamicFilter [ a1@0 >= 10 ]"
     );
     assert_eq!(
         format!("{}", right_filter_clone),
@@ -339,6 +340,56 @@ async fn test_sort_merge_join_dynamic_filter_consensus() -> Result<()> {
         format!("{}", right_filter_clone),
         "DynamicFilter [ a2@0 >= 30 ]"
     );
+
+    // 6. Exhaust P0.
+    // Both sides exhausted -> Sudden Death.
+    let _ = stream0.next().await.transpose()?; // P0 reads 20
+    let _ = stream0.next().await.transpose()?; // P0 reads 30
+    let _ = stream0.next().await.transpose()?; // P0 exhausted
+    assert_eq!(format!("{}", right_filter_clone), "DynamicFilter [ false ]");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_sort_merge_join_dynamic_filter_sudden_death_empty() -> Result<()> {
+    let left = TestMemoryExec::try_new_exec(
+        &[vec![]],
+        Arc::new(Schema::new(vec![Field::new("a1", DataType::Int32, false)])),
+        None,
+    )?;
+    let right = build_table(
+        ("a2", &vec![10, 20, 30]),
+        ("b2", &vec![4, 5, 6]),
+        ("c2", &vec![7, 8, 9]),
+    );
+
+    let on = vec![(
+        Arc::new(Column::new("a1", 0)) as _,
+        Arc::new(Column::new("a2", 0)) as _,
+    )];
+
+    let join = SortMergeJoinExec::try_new(
+        left,
+        right,
+        on.clone(),
+        None,
+        Inner,
+        vec![SortOptions::default()],
+        NullEquality::NullEqualsNothing,
+    )?;
+
+    let right_filter_expr =
+        SortMergeJoinExec::create_dynamic_filter(&on, JoinSide::Right);
+    let right_filter_clone = Arc::clone(&right_filter_expr);
+    let join = join.with_right_dynamic_filter(right_filter_expr);
+
+    let context = TaskContext::default();
+    let mut stream = join.execute(0, Arc::new(context))?;
+
+    // Poll to trigger execution. Left is empty, so it should immediately signal Sudden Death to Right.
+    let _ = stream.next().await.transpose()?;
+    assert_eq!(format!("{}", right_filter_clone), "DynamicFilter [ false ]");
 
     Ok(())
 }
