@@ -472,6 +472,13 @@ impl DisplayAs for SortMergeJoinExec {
                     writeln!(f, "NullsEqual: true")?;
                 }
 
+                if let Some(filter) = &self.left_dynamic_filter {
+                    writeln!(f, "left_dynamic_filter={}", filter.filter)?;
+                }
+                if let Some(filter) = &self.right_dynamic_filter {
+                    writeln!(f, "right_dynamic_filter={}", filter.filter)?;
+                }
+
                 Ok(())
             }
         }
