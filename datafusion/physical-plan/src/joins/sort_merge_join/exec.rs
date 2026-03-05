@@ -737,8 +737,26 @@ impl ExecutionPlan for SortMergeJoinExec {
         let left_col_count = self.left.schema().fields().len();
         let total_col_count = self.schema.fields().len();
 
-        let left_allowed: HashSet<usize> = (0..left_col_count).collect();
-        let right_allowed: HashSet<usize> = (left_col_count..total_col_count).collect();
+        let (left_allowed, right_allowed) = match self.join_type {
+            JoinType::Inner | JoinType::Left | JoinType::Right | JoinType::Full => (
+                (0..left_col_count).collect::<HashSet<_>>(),
+                (left_col_count..total_col_count).collect::<HashSet<_>>(),
+            ),
+            JoinType::LeftSemi | JoinType::LeftAnti => {
+                ((0..total_col_count).collect::<HashSet<_>>(), HashSet::new())
+            }
+            JoinType::RightSemi | JoinType::RightAnti => {
+                (HashSet::new(), (0..total_col_count).collect::<HashSet<_>>())
+            }
+            JoinType::LeftMark => (
+                (0..left_col_count).collect::<HashSet<_>>(),
+                HashSet::new(), // index `left_col_count` is the mark column
+            ),
+            JoinType::RightMark => (
+                HashSet::new(),
+                (0..total_col_count - 1).collect::<HashSet<_>>(), // last index is the mark column
+            ),
+        };
 
         let mut left_child = if left_preserved {
             ChildFilterDescription::from_child_with_allowed_indices(
