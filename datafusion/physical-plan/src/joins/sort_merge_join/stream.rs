@@ -218,9 +218,13 @@ impl StreamedBatch {
         if self.batch.num_rows() <= row_idx {
             return None;
         }
-        self.join_arrays
+        let res = self.join_arrays
             .first()
-            .and_then(|arr| ScalarValue::try_from_array(arr, row_idx).ok())
+            .and_then(|arr| ScalarValue::try_from_array(arr, row_idx).ok());
+        if res.is_none() && !self.join_arrays.is_empty() {
+            log::warn!("SMJ: Failed to extract ScalarValue from join_array at row {}", row_idx);
+        }
+        res
     }
 }
 
@@ -301,9 +305,13 @@ impl BufferedBatch {
         if self.num_rows <= row_idx {
             return None;
         }
-        self.join_arrays
+        let res = self.join_arrays
             .first()
-            .and_then(|arr| ScalarValue::try_from_array(arr, row_idx).ok())
+            .and_then(|arr| ScalarValue::try_from_array(arr, row_idx).ok());
+        if res.is_none() && !self.join_arrays.is_empty() {
+            log::warn!("SMJ: Failed to extract ScalarValue from buffered join_array at row {}", row_idx);
+        }
+        res
     }
 }
 
