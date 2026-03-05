@@ -22,6 +22,7 @@
 use std::any::Any;
 use std::fmt::{Debug, Formatter};
 use std::sync::{Arc, OnceLock};
+use log::warn;
 
 use crate::execution_plan::{EmissionType, boundedness_from_children};
 use crate::expressions::PhysicalSortExpr;
@@ -235,14 +236,17 @@ impl SortMergeJoinExec {
     }
 
     fn allow_join_dynamic_filter_pushdown(&self, config: &ConfigOptions) -> bool {
+        let enabled = config.optimizer.enable_join_dynamic_filter_pushdown;
         if !matches!(
             self.join_type,
             JoinType::Inner | JoinType::LeftSemi | JoinType::RightSemi
-        ) || !config.optimizer.enable_join_dynamic_filter_pushdown
+        ) || !enabled
         {
+            warn!("SMJ: Dynamic filter pushdown NOT allowed. Type: {:?}, Enabled: {}", self.join_type, enabled);
             return false;
         }
 
+        warn!("SMJ: Dynamic filter pushdown allowed. Type: {:?}", self.join_type);
         true
     }
 
@@ -542,6 +546,7 @@ impl ExecutionPlan for SortMergeJoinExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
+        warn!("SMJ: Executing partition {} for join type {:?}", partition, self.join_type);
         let left_partitions = self.left.output_partitioning().partition_count();
         let right_partitions = self.right.output_partitioning().partition_count();
         assert_eq_or_internal_err!(
@@ -726,6 +731,7 @@ impl ExecutionPlan for SortMergeJoinExec {
         parent_filters: Vec<Arc<dyn PhysicalExpr>>,
         config: &ConfigOptions,
     ) -> Result<FilterDescription> {
+        warn!("SMJ: gather_filters_for_pushdown phase: {}, parent_filters: {}", phase, parent_filters.len());
         let (left_preserved, right_preserved) = match self.join_type {
             JoinType::Inner => (true, true),
             JoinType::Left => (true, false),
