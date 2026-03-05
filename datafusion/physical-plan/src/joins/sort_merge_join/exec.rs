@@ -440,9 +440,11 @@ impl DisplayAs for SortMergeJoinExec {
                     } else {
                         ""
                     };
+                let left_df = self.left_dynamic_filter.as_ref().map_or_else(|| "".to_string(), |f| format!(", left_dynamic_filter={}", f.filter));
+                let right_df = self.right_dynamic_filter.as_ref().map_or_else(|| "".to_string(), |f| format!(", right_dynamic_filter={}", f.filter));
                 write!(
                     f,
-                    "{}: join_type={:?}, on=[{}]{}{}",
+                    "{}: join_type={:?}, on=[{}]{}{}{}{}",
                     Self::static_name(),
                     self.join_type,
                     on,
@@ -451,6 +453,8 @@ impl DisplayAs for SortMergeJoinExec {
                         |f| format!(", filter={}", f.expression())
                     ),
                     display_null_equality,
+                    left_df,
+                    right_df,
                 )
             }
             DisplayFormatType::TreeRender => {
