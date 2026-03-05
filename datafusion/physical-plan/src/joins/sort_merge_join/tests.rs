@@ -393,6 +393,71 @@ async fn test_sort_merge_join_dynamic_filter_sudden_death_empty() -> Result<()> 
 
     Ok(())
 }
+
+#[tokio::test]
+async fn test_sort_merge_join_dynamic_filter_descending() -> Result<()> {
+    // Both sides are sorted Descending
+    let left = build_table(
+        ("a1", &vec![30, 20, 10]),
+        ("b1", &vec![4, 5, 6]),
+        ("c1", &vec![7, 8, 9]),
+    );
+    let right = build_table(
+        ("a2", &vec![30, 20, 10]),
+        ("b2", &vec![4, 5, 6]),
+        ("c2", &vec![7, 8, 9]),
+    );
+
+    let on = vec![(
+        Arc::new(Column::new("a1", 0)) as _,
+        Arc::new(Column::new("a2", 0)) as _,
+    )];
+
+    let sort_options = SortOptions {
+        descending: true,
+        nulls_first: false,
+    };
+
+    let join = SortMergeJoinExec::try_new(
+        left,
+        right,
+        on.clone(),
+        None,
+        Inner,
+        vec![sort_options],
+        NullEquality::NullEqualsNothing,
+    )?;
+
+    let left_filter_expr = SortMergeJoinExec::create_dynamic_filter(&on, JoinSide::Left);
+    let right_filter_expr =
+        SortMergeJoinExec::create_dynamic_filter(&on, JoinSide::Right);
+
+    let left_filter_clone = Arc::clone(&left_filter_expr);
+    let right_filter_clone = Arc::clone(&right_filter_expr);
+
+    let join = join
+        .with_left_dynamic_filter(left_filter_expr)
+        .with_right_dynamic_filter(right_filter_expr);
+
+    let config = SessionConfig::new().with_batch_size(1);
+    let context = TaskContext::default().with_session_config(config);
+    let mut stream = join.execute(0, Arc::new(context))?;
+
+    // Poll once: L:30, R:30
+    // For Descending, we want matches <= global_max.
+    // Right side filter: a2 <= max(L_heads) = 30
+    // Left side filter: a1 <= max(R_heads) = 30
+    let _ = stream.next().await.transpose()?;
+    assert_eq!(format!("{}", left_filter_clone), "DynamicFilter [ a1@0 <= 30 ]");
+    assert_eq!(format!("{}", right_filter_clone), "DynamicFilter [ a2@0 <= 30 ]");
+
+    // Next poll: Left advances to 20
+    // Right side filter: a2 <= 20
+    let _ = stream.next().await.transpose()?;
+    assert_eq!(format!("{}", right_filter_clone), "DynamicFilter [ a2@0 <= 20 ]");
+
+    Ok(())
+}
 fn build_table_from_batches(batches: Vec<RecordBatch>) -> Arc<dyn ExecutionPlan> {
     let schema = batches.first().unwrap().schema();
     TestMemoryExec::try_new_exec(&[batches], schema, None).unwrap()
