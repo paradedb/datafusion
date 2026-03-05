@@ -517,7 +517,13 @@ impl ExecutionPlan for FilterExec {
         _config: &ConfigOptions,
     ) -> Result<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
         if !matches!(phase, FilterPushdownPhase::Pre) {
-            return Ok(FilterPushdownPropagation::if_all(child_pushdown_result));
+            let mut result = FilterPushdownPropagation::if_all(child_pushdown_result);
+            if let Some(updated_child) = result.updated_node {
+                let mut new_self = self.clone();
+                new_self.input = updated_child;
+                result.updated_node = Some(Arc::new(new_self) as _);
+            }
+            return Ok(result);
         }
         // We absorb any parent filters that were not handled by our children
         let mut unsupported_parent_filters: Vec<Arc<dyn PhysicalExpr>> =
