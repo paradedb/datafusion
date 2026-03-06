@@ -24,7 +24,6 @@ use datafusion_physical_expr::PhysicalExprRef;
 use datafusion_physical_expr::expressions::{BinaryExpr, DynamicFilterPhysicalExpr, lit};
 use parking_lot::Mutex;
 use std::sync::Arc;
-use log::warn;
 
 /// Coordinates dynamic filter updates for Sort-Merge Join across multiple partitions.
 ///
@@ -60,7 +59,6 @@ impl SharedSortMergeBoundsAccumulator {
         on_expr: PhysicalExprRef,
         dynamic_filter: Arc<DynamicFilterPhysicalExpr>,
     ) -> Self {
-        warn!("SMJ Accumulator: Initializing for {} partitions", num_partitions);
         Self {
             state: Mutex::new(AccumulatorState {
                 heads: vec![None; num_partitions],
@@ -76,7 +74,6 @@ impl SharedSortMergeBoundsAccumulator {
     pub fn report_head(&self, partition_id: usize, head: ScalarValue) -> Result<()> {
         let mut state = self.state.lock();
         state.heads[partition_id] = Some(head.clone());
-        warn!("SMJ Accumulator: Partition {} reported head {}", partition_id, head);
 
         self.update_filter(&state)
     }
@@ -85,7 +82,6 @@ impl SharedSortMergeBoundsAccumulator {
     pub fn mark_exhausted(&self, partition_id: usize) -> Result<()> {
         let mut state = self.state.lock();
         state.exhausted[partition_id] = true;
-        warn!("SMJ Accumulator: Partition {} exhausted", partition_id);
 
         self.update_filter(&state)?;
 
@@ -102,7 +98,6 @@ impl SharedSortMergeBoundsAccumulator {
         // We only publish a bound if all non-exhausted partitions have reported a head.
         let mut active_heads = Vec::new();
         let mut any_active = false;
-        let mut missing_partitions = Vec::new();
 
         for (i, head) in state.heads.iter().enumerate() {
             if !state.exhausted[i] {
@@ -110,25 +105,21 @@ impl SharedSortMergeBoundsAccumulator {
                 if let Some(h) = head {
                     active_heads.push(h);
                 } else {
-                    missing_partitions.push(i);
+                    // At least one active partition hasn't reported yet.
+                    return Ok(());
                 }
             }
         }
 
-        if !missing_partitions.is_empty() {
-            warn!("SMJ Accumulator: Waiting for partitions {:?}", missing_partitions);
-            return Ok(());
-        }
-
         if !any_active {
-            warn!("SMJ Accumulator: Sudden Death (all exhausted)");
+            // All partitions exhausted: sudden death.
+            // No more matches are possible, so we can prune everything.
             return self.dynamic_filter.update(lit(false));
         }
 
         if active_heads.is_empty() {
             // This case is reachable if all partitions were marked exhausted
             // without ever reporting a head (e.g. empty inputs).
-            warn!("SMJ Accumulator: Empty consensus (exhausted before data)");
             return self.dynamic_filter.update(lit(false));
         }
 
@@ -161,7 +152,6 @@ impl SharedSortMergeBoundsAccumulator {
             lit(consensus.clone()),
         ));
 
-        warn!("SMJ Accumulator: Updating filter to {} {}", op, consensus);
         self.dynamic_filter.update(filter_expr)
     }
 }

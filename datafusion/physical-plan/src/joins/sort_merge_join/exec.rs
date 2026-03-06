@@ -19,7 +19,6 @@
 //! A Sort-Merge join plan consumes two sorted children plans and produces
 //! joined output by given join type and other options.
 
-use log::warn;
 use std::any::Any;
 use std::fmt::{Debug, Formatter};
 use std::sync::{Arc, OnceLock};
@@ -236,23 +235,14 @@ impl SortMergeJoinExec {
     }
 
     fn allow_join_dynamic_filter_pushdown(&self, config: &ConfigOptions) -> bool {
-        let enabled = config.optimizer.enable_join_dynamic_filter_pushdown;
         if !matches!(
             self.join_type,
             JoinType::Inner | JoinType::LeftSemi | JoinType::RightSemi
-        ) || !enabled
+        ) || !config.optimizer.enable_join_dynamic_filter_pushdown
         {
-            warn!(
-                "SMJ: Dynamic filter pushdown NOT allowed. Type: {:?}, Enabled: {}",
-                self.join_type, enabled
-            );
             return false;
         }
 
-        warn!(
-            "SMJ: Dynamic filter pushdown allowed. Type: {:?}",
-            self.join_type
-        );
         true
     }
 
@@ -569,10 +559,6 @@ impl ExecutionPlan for SortMergeJoinExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        warn!(
-            "SMJ: Executing partition {} for join type {:?}",
-            partition, self.join_type
-        );
         let left_partitions = self.left.output_partitioning().partition_count();
         let right_partitions = self.right.output_partitioning().partition_count();
         assert_eq_or_internal_err!(
@@ -757,11 +743,6 @@ impl ExecutionPlan for SortMergeJoinExec {
         parent_filters: Vec<Arc<dyn PhysicalExpr>>,
         config: &ConfigOptions,
     ) -> Result<FilterDescription> {
-        warn!(
-            "SMJ: gather_filters_for_pushdown phase: {}, parent_filters: {}",
-            phase,
-            parent_filters.len()
-        );
         let (left_preserved, right_preserved) = match self.join_type {
             JoinType::Inner => (true, true),
             JoinType::Left => (true, false),
@@ -808,14 +789,10 @@ impl ExecutionPlan for SortMergeJoinExec {
 
     fn handle_child_pushdown_result(
         &self,
-        phase: FilterPushdownPhase,
+        _phase: FilterPushdownPhase,
         child_pushdown_result: ChildPushdownResult,
         _config: &ConfigOptions,
     ) -> Result<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
-        warn!(
-            "SortMergeJoinExec: handle_child_pushdown_result phase: {}",
-            phase
-        );
         let mut result: FilterPushdownPropagation<Arc<dyn ExecutionPlan>> =
             FilterPushdownPropagation::if_any(child_pushdown_result.clone());
         assert_eq!(child_pushdown_result.self_filters.len(), 2);
@@ -831,7 +808,6 @@ impl ExecutionPlan for SortMergeJoinExec {
             if let Ok(dynamic_filter) =
                 Arc::downcast::<DynamicFilterPhysicalExpr>(predicate)
             {
-                warn!("SortMergeJoinExec: Accepted left dynamic filter");
                 node = node.with_left_dynamic_filter(dynamic_filter);
                 node_updated_with_filters = true;
             }
@@ -842,14 +818,12 @@ impl ExecutionPlan for SortMergeJoinExec {
             if let Ok(dynamic_filter) =
                 Arc::downcast::<DynamicFilterPhysicalExpr>(predicate)
             {
-                warn!("SortMergeJoinExec: Accepted right dynamic filter");
                 node = node.with_right_dynamic_filter(dynamic_filter);
                 node_updated_with_filters = true;
             }
         }
 
         if let Some(updated_child_plan) = result.updated_node.take() {
-            warn!("SortMergeJoinExec: Child was updated, incorporating changes");
             // If the optimizer already provided an updated version of this node (with new children),
             // we must apply our dynamic filters to THAT version.
             let mut final_node = updated_child_plan
@@ -864,9 +838,6 @@ impl ExecutionPlan for SortMergeJoinExec {
             }
             result.updated_node = Some(Arc::new(final_node) as _);
         } else if node_updated_with_filters {
-            warn!(
-                "SortMergeJoinExec: Node was updated with dynamic filters, updating self"
-            );
             result.updated_node = Some(Arc::new(node) as _);
         }
 

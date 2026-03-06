@@ -235,8 +235,11 @@ impl ExecutionPlan for GlobalLimitExec {
     ) -> Result<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
         let mut result = FilterPushdownPropagation::if_all(child_pushdown_result);
         if let Some(updated_child) = result.updated_node {
-            result.updated_node =
-                Some(Arc::new(GlobalLimitExec::new(updated_child, self.skip, self.fetch)) as _);
+            result.updated_node = Some(Arc::new(GlobalLimitExec::new(
+                updated_child,
+                self.skip,
+                self.fetch,
+            )) as _);
         }
         Ok(result)
     }

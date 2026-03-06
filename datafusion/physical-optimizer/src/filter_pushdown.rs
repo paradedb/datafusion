@@ -443,7 +443,6 @@ fn push_down_filters(
     config: &ConfigOptions,
     phase: FilterPushdownPhase,
 ) -> Result<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
-    log::warn!("FilterPushdown ({}): Visiting node {}", phase, node.name());
     let mut parent_filter_pushdown_supports: Vec<Vec<PushedDown>> =
         vec![vec![]; parent_predicates.len()];
     let mut self_filters_pushdown_supports = vec![];

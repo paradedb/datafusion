@@ -448,13 +448,22 @@ async fn test_sort_merge_join_dynamic_filter_descending() -> Result<()> {
     // Right side filter: a2 <= max(L_heads) = 30
     // Left side filter: a1 <= max(R_heads) = 30
     let _ = stream.next().await.transpose()?;
-    assert_eq!(format!("{}", left_filter_clone), "DynamicFilter [ a1@0 <= 30 ]");
-    assert_eq!(format!("{}", right_filter_clone), "DynamicFilter [ a2@0 <= 30 ]");
+    assert_eq!(
+        format!("{}", left_filter_clone),
+        "DynamicFilter [ a1@0 <= 30 ]"
+    );
+    assert_eq!(
+        format!("{}", right_filter_clone),
+        "DynamicFilter [ a2@0 <= 30 ]"
+    );
 
     // Next poll: Left advances to 20
     // Right side filter: a2 <= 20
     let _ = stream.next().await.transpose()?;
-    assert_eq!(format!("{}", right_filter_clone), "DynamicFilter [ a2@0 <= 20 ]");
+    assert_eq!(
+        format!("{}", right_filter_clone),
+        "DynamicFilter [ a2@0 <= 20 ]"
+    );
 
     Ok(())
 }

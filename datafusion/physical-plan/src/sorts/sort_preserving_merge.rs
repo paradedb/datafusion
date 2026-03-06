@@ -21,13 +21,14 @@ use std::any::Any;
 use std::sync::Arc;
 
 use crate::common::spawn_buffered;
+use crate::filter_pushdown::{
+    ChildPushdownResult, FilterDescription, FilterPushdownPhase,
+    FilterPushdownPropagation,
+};
 use crate::limit::LimitStream;
 use crate::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use crate::projection::{ProjectionExec, make_with_child, update_ordering};
 use crate::sorts::streaming_merge::StreamingMergeBuilder;
-use crate::filter_pushdown::{
-    ChildPushdownResult, FilterDescription, FilterPushdownPhase, FilterPushdownPropagation,
-};
 use crate::{
     DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, ExecutionPlanProperties,
     Partitioning, PlanProperties, SendableRecordBatchStream, Statistics,
@@ -39,7 +40,6 @@ use datafusion_execution::TaskContext;
 use datafusion_execution::memory_pool::MemoryConsumer;
 use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_expr_common::sort_expr::{LexOrdering, OrderingRequirements};
-use log::warn;
 
 use crate::execution_plan::{EvaluationType, SchedulingType};
 use log::{debug, trace};
@@ -405,28 +405,26 @@ impl ExecutionPlan for SortPreservingMergeExec {
 
     fn gather_filters_for_pushdown(
         &self,
-        phase: FilterPushdownPhase,
+        _phase: FilterPushdownPhase,
         parent_filters: Vec<Arc<dyn PhysicalExpr>>,
         _config: &ConfigOptions,
     ) -> Result<FilterDescription> {
-        warn!("SortPreservingMergeExec: gather_filters_for_pushdown phase: {}, parent_filters: {}", phase, parent_filters.len());
-        Ok(FilterDescription::new()
-            .with_child(crate::filter_pushdown::ChildFilterDescription::from_child(
+        Ok(FilterDescription::new().with_child(
+            crate::filter_pushdown::ChildFilterDescription::from_child(
                 &parent_filters,
                 &self.input,
-            )?))
+            )?,
+        ))
     }
 
     fn handle_child_pushdown_result(
         &self,
-        phase: FilterPushdownPhase,
+        _phase: FilterPushdownPhase,
         child_pushdown_result: ChildPushdownResult,
         _config: &ConfigOptions,
     ) -> Result<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
-        warn!("SortPreservingMergeExec: handle_child_pushdown_result phase: {}", phase);
         let mut result = FilterPushdownPropagation::if_all(child_pushdown_result);
         if let Some(updated_child) = result.updated_node {
-            warn!("SortPreservingMergeExec: Child was updated, updating self");
             let mut new_self = self.clone();
             new_self.input = updated_child;
             result.updated_node = Some(Arc::new(new_self) as _);
