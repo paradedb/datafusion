@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 /// Coordinates dynamic filter updates for Sort-Merge Join across multiple partitions.
 ///
-/// This accumulator implements "Consensus of the Slowest Progress". A global bound
+/// This accumulator implements "consensus of the slowest progress". A global bound
 /// is only published once all active partitions have reported at least one row,
 /// and it advances based on the minimum (for ascending) or maximum (for descending)
 /// of all current partition heads.

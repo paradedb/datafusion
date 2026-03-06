@@ -770,6 +770,16 @@ impl ExecutionPlan for SortMergeJoinExec {
         parent_filters: Vec<Arc<dyn PhysicalExpr>>,
         config: &ConfigOptions,
     ) -> Result<FilterDescription> {
+        // This is the physical-plan equivalent of `push_down_all_join` in
+        // `datafusion/optimizer/src/push_down_filter.rs`.
+        //
+        // We determine which parent filters can be pushed down to which child based on two criteria:
+        // 1. **Column Preservation**: A side is "preserved" if its columns are present in the join output.
+        //    For example, in a `Left` join, the left side is preserved but the right side is not (right columns are null-padded).
+        //    We can only push filters to preserved sides because non-preserved sides may need all rows
+        //    to correctly produce null-padded matches.
+        // 2. **Column References**: `ChildFilterDescription::from_child` ensures that a filter is only
+        //    routed to a child if that child's schema contains all columns referenced by the filter.
         let (left_preserved, right_preserved) = match self.join_type {
             JoinType::Inner => (true, true),
             JoinType::Left => (true, false),
@@ -820,6 +830,9 @@ impl ExecutionPlan for SortMergeJoinExec {
         child_pushdown_result: ChildPushdownResult,
         _config: &ConfigOptions,
     ) -> Result<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
+        // This method performs the "Upward Handshake" of the physical optimizer.
+        // It receives the result of pushing filters down to our children and decides
+        // whether to update this node to reflect those changes.
         let mut result: FilterPushdownPropagation<Arc<dyn ExecutionPlan>> =
             FilterPushdownPropagation::if_any(child_pushdown_result.clone());
         assert_eq!(child_pushdown_result.self_filters.len(), 2);
@@ -830,6 +843,8 @@ impl ExecutionPlan for SortMergeJoinExec {
         let mut node = (*self).clone();
         let mut node_updated_with_filters = false;
 
+        // 1. Check if our children accepted the dynamic filters we generated in `gather_filters_for_pushdown`.
+        // If so, we store the filter reference in this node so we can update it during execution.
         if let Some(filter) = left_child_self_filters.first() {
             let predicate = Arc::clone(&filter.predicate);
             if let Ok(dynamic_filter) =
@@ -850,9 +865,11 @@ impl ExecutionPlan for SortMergeJoinExec {
             }
         }
 
+        // 2. Determine the final updated node to return to the parent.
         if let Some(updated_child_plan) = result.updated_node.take() {
-            // If the optimizer already provided an updated version of this node (with new children),
-            // we must apply our dynamic filters to THAT version.
+            // Case A: The optimizer rule already provided an updated version of this node
+            // (e.g., because children were replaced). We must ensure our dynamic filters
+            // are applied to that specific version to maintain the chain.
             let mut final_node = updated_child_plan
                 .as_any()
                 .downcast_ref::<SortMergeJoinExec>()
@@ -865,6 +882,7 @@ impl ExecutionPlan for SortMergeJoinExec {
             }
             result.updated_node = Some(Arc::new(final_node) as _);
         } else if node_updated_with_filters {
+            // Case B: Children didn't change, but we added dynamic filters to ourselves.
             result.updated_node = Some(Arc::new(node) as _);
         }
 
