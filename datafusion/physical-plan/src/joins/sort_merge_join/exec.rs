@@ -554,6 +554,29 @@ impl ExecutionPlan for SortMergeJoinExec {
         }
     }
 
+    fn reset_state(self: Arc<Self>) -> Result<Arc<dyn ExecutionPlan>> {
+        let mut new_node = (*self).clone();
+
+        // Reset dynamic filters by creating new containers with fresh OnceLocks
+        if let Some(f) = &self.left_dynamic_filter {
+            new_node.left_dynamic_filter = Some(SortMergeJoinExecDynamicFilter {
+                filter: Arc::clone(&f.filter),
+                accumulator: Arc::new(OnceLock::new()),
+            });
+        }
+        if let Some(f) = &self.right_dynamic_filter {
+            new_node.right_dynamic_filter = Some(SortMergeJoinExecDynamicFilter {
+                filter: Arc::clone(&f.filter),
+                accumulator: Arc::new(OnceLock::new()),
+            });
+        }
+
+        // Reset metrics
+        new_node.metrics = ExecutionPlanMetricsSet::new();
+
+        Ok(Arc::new(new_node))
+    }
+
     fn execute(
         &self,
         partition: usize,
@@ -585,6 +608,8 @@ impl ExecutionPlan for SortMergeJoinExec {
                 )
             };
 
+        let metrics = SortMergeJoinMetrics::new(partition, &self.metrics);
+
         // Initialize dynamic filters if they exist
         let left_dynamic_filter = self.left_dynamic_filter.as_ref().map(|f| {
             let accumulator = f.accumulator.get_or_init(|| {
@@ -593,6 +618,7 @@ impl ExecutionPlan for SortMergeJoinExec {
                     self.sort_options[0],
                     Arc::clone(&on_left[0]),
                     Arc::clone(&f.filter),
+                    Some(metrics.dynamic_filter_updates()),
                 ))
             });
             Arc::clone(accumulator)
@@ -605,6 +631,7 @@ impl ExecutionPlan for SortMergeJoinExec {
                     self.sort_options[0],
                     Arc::clone(&on_right[0]),
                     Arc::clone(&f.filter),
+                    Some(metrics.dynamic_filter_updates()),
                 ))
             });
             Arc::clone(accumulator)
@@ -641,7 +668,7 @@ impl ExecutionPlan for SortMergeJoinExec {
             self.filter.clone(),
             self.join_type,
             batch_size,
-            SortMergeJoinMetrics::new(partition, &self.metrics),
+            metrics,
             reservation,
             context.runtime_env(),
             streamed_dynamic_filter,

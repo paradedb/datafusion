@@ -8,15 +8,15 @@
 //
 //   http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Shared bounds for Sort-Merge Join dynamic filter pushdown.
 
+use crate::metrics::Count;
 use arrow::compute::SortOptions;
 use datafusion_common::{Result, ScalarValue};
 use datafusion_expr::Operator;
@@ -41,6 +41,8 @@ pub(crate) struct SharedSortMergeBoundsAccumulator {
     sort_options: SortOptions,
     /// Join key expression on the side being filtered.
     on_expr: PhysicalExprRef,
+    /// Metric to track number of filter updates.
+    metrics: Option<Count>,
 }
 
 #[derive(Debug)]
@@ -58,6 +60,7 @@ impl SharedSortMergeBoundsAccumulator {
         sort_options: SortOptions,
         on_expr: PhysicalExprRef,
         dynamic_filter: Arc<DynamicFilterPhysicalExpr>,
+        metrics: Option<Count>,
     ) -> Self {
         Self {
             state: Mutex::new(AccumulatorState {
@@ -67,6 +70,7 @@ impl SharedSortMergeBoundsAccumulator {
             dynamic_filter,
             sort_options,
             on_expr,
+            metrics,
         }
     }
 
@@ -152,6 +156,12 @@ impl SharedSortMergeBoundsAccumulator {
             lit(consensus.clone()),
         ));
 
-        self.dynamic_filter.update(filter_expr)
+        self.dynamic_filter.update(filter_expr)?;
+
+        if let Some(m) = &self.metrics {
+            m.add(1);
+        }
+
+        Ok(())
     }
 }
