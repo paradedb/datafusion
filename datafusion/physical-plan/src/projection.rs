@@ -38,6 +38,7 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use log::warn;
 
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
@@ -343,10 +344,11 @@ impl ExecutionPlan for ProjectionExec {
 
     fn gather_filters_for_pushdown(
         &self,
-        _phase: FilterPushdownPhase,
+        phase: FilterPushdownPhase,
         parent_filters: Vec<Arc<dyn PhysicalExpr>>,
         _config: &ConfigOptions,
     ) -> Result<FilterDescription> {
+        warn!("ProjectionExec: gather_filters_for_pushdown phase: {}, parent_filters: {}", phase, parent_filters.len());
         // TODO: In future, we can try to handle inverting aliases here.
         // For the time being, we pass through untransformed filters, so filters on aliases are not handled.
         // https://github.com/apache/datafusion/issues/17246
@@ -355,12 +357,14 @@ impl ExecutionPlan for ProjectionExec {
 
     fn handle_child_pushdown_result(
         &self,
-        _phase: FilterPushdownPhase,
+        phase: FilterPushdownPhase,
         child_pushdown_result: ChildPushdownResult,
         _config: &ConfigOptions,
     ) -> Result<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
+        warn!("ProjectionExec: handle_child_pushdown_result phase: {}", phase);
         let mut result = FilterPushdownPropagation::if_all(child_pushdown_result);
         if let Some(updated_child) = result.updated_node {
+            warn!("ProjectionExec: Child was updated, updating self");
             let mut new_self = self.clone();
             new_self.input = updated_child;
             result.updated_node = Some(Arc::new(new_self) as _);

@@ -789,24 +789,29 @@ impl ExecutionPlan for SortMergeJoinExec {
 
     fn handle_child_pushdown_result(
         &self,
-        _phase: FilterPushdownPhase,
+        phase: FilterPushdownPhase,
         child_pushdown_result: ChildPushdownResult,
         _config: &ConfigOptions,
     ) -> Result<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
-        let mut result = FilterPushdownPropagation::if_any(child_pushdown_result.clone());
+        warn!("SortMergeJoinExec: handle_child_pushdown_result phase: {}", phase);
+        let mut result: FilterPushdownPropagation<Arc<dyn ExecutionPlan>> =
+            FilterPushdownPropagation::if_any(child_pushdown_result.clone());
         assert_eq!(child_pushdown_result.self_filters.len(), 2);
 
         let left_child_self_filters = &child_pushdown_result.self_filters[0];
         let right_child_self_filters = &child_pushdown_result.self_filters[1];
 
         let mut node = (*self).clone();
+        let mut updated = false;
 
         if let Some(filter) = left_child_self_filters.first() {
             let predicate = Arc::clone(&filter.predicate);
             if let Ok(dynamic_filter) =
                 Arc::downcast::<DynamicFilterPhysicalExpr>(predicate)
             {
+                warn!("SortMergeJoinExec: Accepted left dynamic filter");
                 node = node.with_left_dynamic_filter(dynamic_filter);
+                updated = true;
             }
         }
 
@@ -815,11 +820,30 @@ impl ExecutionPlan for SortMergeJoinExec {
             if let Ok(dynamic_filter) =
                 Arc::downcast::<DynamicFilterPhysicalExpr>(predicate)
             {
+                warn!("SortMergeJoinExec: Accepted right dynamic filter");
                 node = node.with_right_dynamic_filter(dynamic_filter);
+                updated = true;
             }
         }
 
-        result.updated_node = Some(Arc::new(node) as _);
+        if let Some(ref updated_node) = result.updated_node {
+            warn!("SortMergeJoinExec: Node was already updated by child pushdown");
+            if updated {
+                warn!("SortMergeJoinExec: Applying dynamic filters to already updated node");
+                let mut new_node = updated_node
+                    .as_any()
+                    .downcast_ref::<SortMergeJoinExec>()
+                    .expect("updated_node is our own type")
+                    .clone();
+                new_node.left_dynamic_filter = node.left_dynamic_filter;
+                new_node.right_dynamic_filter = node.right_dynamic_filter;
+                result.updated_node = Some(Arc::new(new_node) as _);
+            }
+        } else if updated {
+            warn!("SortMergeJoinExec: Node was updated with dynamic filters, updating self");
+            result.updated_node = Some(Arc::new(node) as _);
+        }
+
         Ok(result)
     }
 }

@@ -66,6 +66,7 @@ use datafusion_execution::runtime_env::RuntimeEnv;
 use datafusion_physical_expr::LexOrdering;
 use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_expr::expressions::{DynamicFilterPhysicalExpr, lit};
+use log::warn;
 
 use futures::{StreamExt, TryStreamExt};
 use log::{debug, trace};
@@ -1415,6 +1416,7 @@ impl ExecutionPlan for SortExec {
         parent_filters: Vec<Arc<dyn PhysicalExpr>>,
         config: &datafusion_common::config::ConfigOptions,
     ) -> Result<FilterDescription> {
+        warn!("SortExec: gather_filters_for_pushdown phase: {}, parent_filters: {}", phase, parent_filters.len());
         if !matches!(phase, FilterPushdownPhase::Post) {
             return FilterDescription::from_children(parent_filters, &self.children());
         }
@@ -1425,6 +1427,7 @@ impl ExecutionPlan for SortExec {
         if let Some(filter) = &self.filter
             && config.optimizer.enable_topk_dynamic_filter_pushdown
         {
+            warn!("SortExec: Adding TopK dynamic filter to child");
             child = child.with_self_filter(filter.read().expr());
         }
 
@@ -1433,12 +1436,14 @@ impl ExecutionPlan for SortExec {
 
     fn handle_child_pushdown_result(
         &self,
-        _phase: FilterPushdownPhase,
+        phase: FilterPushdownPhase,
         child_pushdown_result: ChildPushdownResult,
         _config: &datafusion_common::config::ConfigOptions,
     ) -> Result<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
+        warn!("SortExec: handle_child_pushdown_result phase: {}", phase);
         let mut result = FilterPushdownPropagation::if_all(child_pushdown_result);
         if let Some(updated_child) = result.updated_node {
+            warn!("SortExec: Child was updated, updating self");
             let mut new_self = self.cloned();
             new_self.input = updated_child;
             result.updated_node = Some(Arc::new(new_self) as _);

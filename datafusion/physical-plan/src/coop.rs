@@ -67,6 +67,7 @@
 
 use datafusion_common::config::ConfigOptions;
 use datafusion_physical_expr::PhysicalExpr;
+use log::warn;
 #[cfg(datafusion_coop = "tokio_fallback")]
 use futures::Future;
 use std::any::Any;
@@ -314,21 +315,24 @@ impl ExecutionPlan for CooperativeExec {
 
     fn gather_filters_for_pushdown(
         &self,
-        _phase: FilterPushdownPhase,
+        phase: FilterPushdownPhase,
         parent_filters: Vec<Arc<dyn PhysicalExpr>>,
         _config: &ConfigOptions,
     ) -> Result<FilterDescription> {
+        warn!("CooperativeExec: gather_filters_for_pushdown phase: {}, parent_filters: {}", phase, parent_filters.len());
         FilterDescription::from_children(parent_filters, &self.children())
     }
 
     fn handle_child_pushdown_result(
         &self,
-        _phase: FilterPushdownPhase,
+        phase: FilterPushdownPhase,
         child_pushdown_result: ChildPushdownResult,
         _config: &ConfigOptions,
     ) -> Result<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
+        warn!("CooperativeExec: handle_child_pushdown_result phase: {}", phase);
         let mut result = FilterPushdownPropagation::if_all(child_pushdown_result);
         if let Some(updated_child) = result.updated_node {
+            warn!("CooperativeExec: Child was updated, updating self");
             result.updated_node =
                 Some(Arc::new(CooperativeExec::new(updated_child)) as _);
         }
