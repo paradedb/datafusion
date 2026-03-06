@@ -140,17 +140,29 @@ async fn test_sort_merge_join_dynamic_filter_initial_bound() -> Result<()> {
 
 #[tokio::test]
 async fn test_sort_merge_join_dynamic_filter_progressive_tightening() -> Result<()> {
-    // Both sides have matching values to allow outputting one row at a time
+    // Each row is in its own batch to trigger batch-boundary updates
     let batch1 = RecordBatch::try_new(
         Arc::new(Schema::new(vec![Field::new("a1", DataType::Int32, false)])),
-        vec![Arc::new(Int32Array::from(vec![10, 20]))],
+        vec![Arc::new(Int32Array::from(vec![10]))],
     )?;
     let batch2 = RecordBatch::try_new(
         Arc::new(Schema::new(vec![Field::new("a1", DataType::Int32, false)])),
-        vec![Arc::new(Int32Array::from(vec![30, 40]))],
+        vec![Arc::new(Int32Array::from(vec![20]))],
+    )?;
+    let batch3 = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("a1", DataType::Int32, false)])),
+        vec![Arc::new(Int32Array::from(vec![30]))],
+    )?;
+    let batch4 = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("a1", DataType::Int32, false)])),
+        vec![Arc::new(Int32Array::from(vec![40]))],
     )?;
     let schema_left = batch1.schema();
-    let left = TestMemoryExec::try_new_exec(&[vec![batch1, batch2]], schema_left, None)?;
+    let left = TestMemoryExec::try_new_exec(
+        &[vec![batch1, batch2, batch3, batch4]],
+        schema_left,
+        None,
+    )?;
 
     let right_batch = RecordBatch::try_new(
         Arc::new(Schema::new(vec![Field::new("a2", DataType::Int32, false)])),
@@ -201,21 +213,21 @@ async fn test_sort_merge_join_dynamic_filter_progressive_tightening() -> Result<
         "DynamicFilter [ a2@0 >= 10 ]"
     );
 
-    // 2. Next poll: advances to 20
+    // 2. Next poll: advances to batch 2 (Left: 20)
     let _ = stream.next().await.transpose()?;
     assert_eq!(
         format!("{}", right_filter_clone),
         "DynamicFilter [ a2@0 >= 20 ]"
     );
 
-    // 3. Next poll: advances to 30
+    // 3. Next poll: advances to batch 3 (Left: 30)
     let _ = stream.next().await.transpose()?;
     assert_eq!(
         format!("{}", right_filter_clone),
         "DynamicFilter [ a2@0 >= 30 ]"
     );
 
-    // 4. Next poll: advances to 40
+    // 4. Next poll: advances to batch 4 (Left: 40)
     let _ = stream.next().await.transpose()?;
     assert_eq!(
         format!("{}", right_filter_clone),

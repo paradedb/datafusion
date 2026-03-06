@@ -206,21 +206,12 @@ impl StreamedBatch {
 
     /// Returns the first join key value in this batch
     fn first_join_key(&self) -> Option<ScalarValue> {
-        self.key_at(0)
-    }
-
-    /// Returns the current join key value being processed in this batch
-    fn current_join_key(&self) -> Option<ScalarValue> {
-        self.key_at(self.idx)
-    }
-
-    fn key_at(&self, row_idx: usize) -> Option<ScalarValue> {
-        if self.batch.num_rows() <= row_idx {
+        if self.batch.num_rows() == 0 {
             return None;
         }
         self.join_arrays
             .first()
-            .and_then(|arr| ScalarValue::try_from_array(arr, row_idx).ok())
+            .and_then(|arr| ScalarValue::try_from_array(arr, 0).ok())
     }
 }
 
@@ -287,23 +278,12 @@ impl BufferedBatch {
 
     /// Returns the first join key value in this batch
     fn first_join_key(&self) -> Option<ScalarValue> {
-        self.key_at(0)
-    }
-
-    /// Returns the current join key value being processed in this batch
-    fn current_join_key(&self) -> Option<ScalarValue> {
-        // Since all rows in a BufferedBatch have the same join key,
-        // we can just return the key at index 0.
-        self.key_at(0)
-    }
-
-    fn key_at(&self, row_idx: usize) -> Option<ScalarValue> {
-        if self.num_rows <= row_idx {
+        if self.num_rows == 0 {
             return None;
         }
         self.join_arrays
             .first()
-            .and_then(|arr| ScalarValue::try_from_array(arr, row_idx).ok())
+            .and_then(|arr| ScalarValue::try_from_array(arr, 0).ok())
     }
 }
 
@@ -1110,14 +1090,6 @@ impl SortMergeJoinStream {
                     if self.streamed_batch.idx + 1 < self.streamed_batch.batch.num_rows()
                     {
                         self.streamed_batch.idx += 1;
-
-                        // Report head update to the BUFFERED side's dynamic filter
-                        if let Some(accumulator) = &self.buffered_dynamic_filter {
-                            if let Some(key) = self.streamed_batch.current_join_key() {
-                                accumulator.report_head(self.partition_id, key)?;
-                            }
-                        }
-
                         self.streamed_state = StreamedState::Ready;
                         return Poll::Ready(Some(Ok(())));
                     } else {
@@ -1226,21 +1198,6 @@ impl SortMergeJoinStream {
                             {
                                 self.produce_buffered_not_matched(&mut buffered_batch)?;
                                 self.free_reservation(&buffered_batch)?;
-
-                                // After popping, the next batch in the queue becomes the new head.
-                                // Report its head to the STREAMED side's dynamic filter.
-                                if let Some(accumulator) = &self.streamed_dynamic_filter {
-                                    if !self.buffered_data.batches.is_empty() {
-                                        if let Some(key) = self
-                                            .buffered_data
-                                            .head_batch()
-                                            .current_join_key()
-                                        {
-                                            accumulator
-                                                .report_head(self.partition_id, key)?;
-                                        }
-                                    }
-                                }
                             }
                         } else {
                             // If the head batch is not fully processed, break the loop.
