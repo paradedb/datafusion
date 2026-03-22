@@ -220,6 +220,16 @@ impl StreamedBatch {
             .first()
             .and_then(|arr| ScalarValue::try_from_array(arr, 0).ok())
     }
+
+    /// Returns the last join key value in this batch
+    fn last_join_key(&self) -> Option<ScalarValue> {
+        if self.batch.num_rows() == 0 {
+            return None;
+        }
+        self.join_arrays
+            .first()
+            .and_then(|arr| ScalarValue::try_from_array(arr, self.batch.num_rows() - 1).ok())
+    }
 }
 
 /// A buffered batch that contains contiguous rows with same join key
@@ -291,6 +301,16 @@ impl BufferedBatch {
         self.join_arrays
             .first()
             .and_then(|arr| ScalarValue::try_from_array(arr, 0).ok())
+    }
+
+    /// Returns the last join key value in this batch
+    fn last_join_key(&self) -> Option<ScalarValue> {
+        if self.num_rows == 0 {
+            return None;
+        }
+        self.join_arrays
+            .first()
+            .and_then(|arr| ScalarValue::try_from_array(arr, self.num_rows - 1).ok())
     }
 }
 
@@ -882,6 +902,12 @@ impl SortMergeJoinStream {
                         self.streamed_state = StreamedState::Ready;
                         return Poll::Ready(Some(Ok(())));
                     } else {
+                        // Report last join key before pulling next batch
+                        if let Some(accumulator) = &self.buffered_dynamic_filter {
+                            if let Some(key) = self.streamed_batch.last_join_key() {
+                                accumulator.report_head(self.partition_id, key)?;
+                            }
+                        }
                         self.streamed_state = StreamedState::Polling;
                     }
                 }
@@ -1054,6 +1080,13 @@ impl SortMergeJoinStream {
                             }
                         }
                     } else {
+                        // Report last join key before pulling next batch
+                        if let Some(accumulator) = &self.streamed_dynamic_filter {
+                            if let Some(key) = self.buffered_data.tail_batch().last_join_key() {
+                                accumulator.report_head(self.partition_id, key)?;
+                            }
+                        }
+
                         match self.buffered.poll_next_unpin(cx)? {
                             Poll::Pending => {
                                 return Poll::Pending;
