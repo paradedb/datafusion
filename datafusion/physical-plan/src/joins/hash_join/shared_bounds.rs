@@ -713,9 +713,10 @@ impl SharedBuildAccumulator {
                         partition_filters.len(),
                         range_partitioning.partition_count()
                     );
-                    let routing_range_expr = Arc::new(RangeExpr::try_new(
+                    let routing_range_expr = Arc::new(RangeExpr::try_new_with_schema(
                         self.on_right.clone(),
                         range_partitioning,
+                        &self.probe_schema,
                     )?)
                         as Arc<dyn PhysicalExpr>;
                     let else_expr = partition_filters
