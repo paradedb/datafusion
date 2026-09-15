@@ -938,6 +938,12 @@ struct RepartitionRequirementStatus {
 
 /// Per-child state while enforcing a parent's distribution requirements.
 struct DistributionChildState {
+    /// Scaling a native range layout must not lose its preference over a newly
+    /// introduced hash exchange when choosing a co-partitioning reference.
+    scaled_native_range: bool,
+    /// This range would previously have been replaced to increase parallelism,
+    /// but its samples cannot support the preferred partition count.
+    preserved_unscalable_range: bool,
     context: DistributionContext,
     required_input_ordering: Option<OrderingRequirements>,
     maintains_input_order: bool,
@@ -1139,7 +1145,8 @@ fn enforce_distribution_relationships(
                 let partitioning = plan.output_partitioning();
                 match partitioning {
                     Partitioning::Range(_) | Partitioning::Hash(_, _) => {
-                        let is_native = !plan.is::<RepartitionExec>();
+                        let is_native =
+                            !plan.is::<RepartitionExec>() || child.scaled_native_range;
                         satisfied_children.push((i, partitioning.clone(), is_native));
                     }
                     _ => {}
@@ -1179,11 +1186,9 @@ fn enforce_distribution_relationships(
                         })
                         .collect();
 
-                    // Only select a reference candidate if there is a unique, strictly
-                    // larger winner (`size_a > size_b`). If candidates have equal or
-                    // incomparable sizes (e.g. non-overlapping metrics), return None
-                    // so the optimizer avoids arbitrary tie-breaking and falls back to
-                    // standard distribution.
+                    // Prefer a unique, strictly larger winner (`size_a > size_b`).
+                    // Otherwise avoid arbitrary tie-breaking, except for the new
+                    // preserved-range case below.
                     candidates
                         .iter()
                         .find(|(size_a, idx_a, _)| {
@@ -1191,6 +1196,25 @@ fn enforce_distribution_relationships(
                                 && candidates.iter().all(|(size_b, idx_b, _)| {
                                     idx_a == idx_b || size_a > size_b
                                 })
+                        })
+                        .or_else(|| {
+                            // Keeping an unscalable range can introduce a new tie.
+                            // Preserve the previously sole native reference when
+                            // it already provides the requested parallelism.
+                            candidates.iter().find(|(_, idx, partitioning)| {
+                                matches!(partitioning, Partitioning::Range(_))
+                                    && (!children[*idx]
+                                        .context
+                                        .plan
+                                        .is::<RepartitionExec>()
+                                        || children[*idx].scaled_native_range)
+                                    && partitioning.partition_count() >= target_partitions
+                                    && candidates.iter().all(|(_, other_idx, _)| {
+                                        idx == other_idx
+                                            || children[*other_idx]
+                                                .preserved_unscalable_range
+                                    })
+                            })
                         })
                         .map(|(_, idx, part)| (*idx, part.clone()))
                 }
@@ -1297,6 +1321,8 @@ fn enforce_distribution_relationships(
             let plan = Arc::new(repartition) as _;
             children[child_idx].context =
                 DistributionContext::new(plan, true, vec![original_child]);
+            children[child_idx].scaled_native_range = false;
+            children[child_idx].preserved_unscalable_range = false;
             repartitioned_for_relationship[child_idx] = true;
             changed = true;
         }
@@ -1514,13 +1540,14 @@ pub fn ensure_distribution(
                 child.plan = new_child;
             }
 
+            let mut scaled_native_range = false;
+            let mut preserved_unscalable_range = false;
             // Satisfy the distribution requirement if it is unmet.
             match &requirement {
                 Distribution::SinglePartition => {
                     child = add_merge_on_top(child, removed_fetch);
                 }
-                Distribution::HashPartitioned(exprs)
-                | Distribution::KeyPartitioned(exprs) => {
+                Distribution::HashPartitioned(_) | Distribution::KeyPartitioned(_) => {
                     let child_partitions =
                         child.plan.output_partitioning().partition_count();
                     let partitioning_satisfied = input_distributions
@@ -1538,21 +1565,60 @@ pub fn ensure_distribution(
                             && target_partitions > child_partitions;
 
                     // When subset satisfaction is enabled, preserve an
-                    // already-satisfying partitioning. Otherwise, hash
+                    // already-satisfying partitioning. Otherwise,
                     // repartition may also increase parallelism.
-                    let needs_hash_repartition = if allow_subset_satisfy_partitioning {
+                    let needs_repartition = if allow_subset_satisfy_partitioning {
                         !partitioning_satisfied
                     } else {
                         !partitioning_satisfied
                             || (target_partitions > child_partitions
                                 && !preserve_satisfying_file_partitioning)
                     };
-                    let should_add_hash_repartition =
-                        hash_necessary && needs_hash_repartition;
+                    let should_add_repartition = hash_necessary && needs_repartition;
 
                     // See https://github.com/apache/datafusion/issues/18341#issuecomment-3503238325 for background
-                    // When inserting hash is necessary to satisfy hash requirement, insert hash repartition.
-                    if should_add_hash_repartition {
+                    // Enforce unmet requirements, or increase parallelism when beneficial.
+                    if should_add_repartition {
+                        let partitioning = match child.plan.output_partitioning() {
+                            Partitioning::Range(range) if partitioning_satisfied => {
+                                // A satisfying range layout remains useful to the
+                                // co-partitioning pass even when its samples cannot
+                                // support the preferred degree of parallelism.
+                                if target_partitions <= range.max_partition_count() {
+                                    let scaled = Partitioning::Range(
+                                        range.scale(target_partitions)?,
+                                    );
+                                    // A single partition satisfies any key requirement,
+                                    // but scaling it must still use compatible keys.
+                                    if scaled
+                                        .satisfaction(
+                                            &requirement,
+                                            child.plan.equivalence_properties(),
+                                            false,
+                                        )
+                                        .is_satisfied()
+                                    {
+                                        scaled_native_range =
+                                            !child.plan.is::<RepartitionExec>();
+                                        Some(scaled)
+                                    } else {
+                                        Some(
+                                            requirement
+                                                .clone()
+                                                .create_partitioning(target_partitions),
+                                        )
+                                    }
+                                } else {
+                                    preserved_unscalable_range = true;
+                                    None
+                                }
+                            }
+                            _ => Some(
+                                requirement
+                                    .clone()
+                                    .create_partitioning(target_partitions),
+                            ),
+                        };
                         // When there is an existing ordering, we preserve ordering during
                         // repartition. This will be rolled back in the future if any of the
                         // following conditions is true:
@@ -1560,15 +1626,15 @@ pub fn ensure_distribution(
                         //   requirements.
                         // - Usage of order preserving variants is not desirable (per the flag
                         //   `config.optimizer.prefer_existing_sort`).
-                        let partitioning = Distribution::KeyPartitioned(exprs.to_vec())
-                            .create_partitioning(target_partitions);
-                        let repartition = RepartitionExec::try_new(
-                            Arc::clone(&child.plan),
-                            partitioning,
-                        )?
-                        .with_preserve_order();
-                        let plan = Arc::new(repartition) as _;
-                        child = DistributionContext::new(plan, true, vec![child]);
+                        if let Some(partitioning) = partitioning {
+                            let repartition = RepartitionExec::try_new(
+                                Arc::clone(&child.plan),
+                                partitioning,
+                            )?
+                            .with_preserve_order();
+                            let plan = Arc::new(repartition) as _;
+                            child = DistributionContext::new(plan, true, vec![child]);
+                        }
                     }
                 }
                 Distribution::UnspecifiedDistribution => {
@@ -1581,6 +1647,8 @@ pub fn ensure_distribution(
             };
 
             Ok(DistributionChildState {
+                scaled_native_range,
+                preserved_unscalable_range,
                 context: child,
                 required_input_ordering,
                 maintains_input_order: maintains,
@@ -1604,6 +1672,8 @@ pub fn ensure_distribution(
         .into_iter()
         .map(
             |DistributionChildState {
+                 scaled_native_range: _,
+                 preserved_unscalable_range: _,
                  mut context,
                  required_input_ordering,
                  maintains_input_order,
