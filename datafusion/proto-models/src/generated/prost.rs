@@ -2241,6 +2241,11 @@ pub struct HashJoinExecNode {
     /// they can only hold scalar `NOT IN` joins.
     #[prost(uint32, tag = "13")]
     pub null_aware_value_keys: u32,
+    /// Whether to coalesce output batches across probe batches. Marked `optional`
+    /// so that older messages without this field decode to `None` and default to
+    /// `true` rather than proto3's implicit `false`.
+    #[prost(bool, optional, tag = "14")]
+    pub coalesce_batches: ::core::option::Option<bool>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SymmetricHashJoinExecNode {
