@@ -487,10 +487,12 @@ impl HashJoinStream {
         mode: PartitionMode,
         null_aware: bool,
         fetch: Option<usize>,
+        coalesce_batches: bool,
     ) -> Self {
         // Create output buffer with coalescing and optional fetch limit.
         let output_buffer =
-            LimitedBatchCoalescer::new(Arc::clone(&schema), batch_size, fetch);
+            LimitedBatchCoalescer::new(Arc::clone(&schema), batch_size, fetch)
+                .with_coalesce_batches(coalesce_batches);
 
         Self {
             partition,

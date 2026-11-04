@@ -2049,6 +2049,11 @@ pub struct HashJoinExecNode {
     /// `None`, which is the correct reading of an older message.
     #[prost(uint64, optional, tag = "12")]
     pub fetch: ::core::option::Option<u64>,
+    /// Whether to coalesce output batches across probe batches. Marked `optional`
+    /// so that older messages without this field decode to `None` and default to
+    /// `true` rather than proto3's implicit `false`.
+    #[prost(bool, optional, tag = "13")]
+    pub coalesce_batches: ::core::option::Option<bool>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SymmetricHashJoinExecNode {

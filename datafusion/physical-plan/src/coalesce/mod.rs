@@ -33,6 +33,8 @@ pub struct LimitedBatchCoalescer {
     fetch: Option<usize>,
     /// Indicates if the coalescer is finished
     finished: bool,
+    /// Target batch size for coalescing
+    target_batch_size: usize,
 }
 
 /// Status returned by [`LimitedBatchCoalescer::push_batch`]
@@ -65,7 +67,26 @@ impl LimitedBatchCoalescer {
             total_rows: 0,
             fetch,
             finished: false,
+            target_batch_size,
         }
+    }
+
+    /// Enable or disable batch coalescing.
+    ///
+    /// When `false`, every non-empty batch pushed into the coalescer bypasses
+    /// buffering and is immediately available via [`Self::next_completed_batch`],
+    /// while still respecting `fetch` limits and skipping empty batches.
+    ///
+    /// TODO(<https://github.com/apache/datafusion/issues/27109>): Also wire
+    /// `datafusion.execution.coalesce_batches` into operators using [`LimitedBatchCoalescer`].
+    pub fn with_coalesce_batches(mut self, coalesce_batches: bool) -> Self {
+        let limit = if coalesce_batches {
+            Some(self.target_batch_size / 2)
+        } else {
+            Some(0)
+        };
+        self.inner.set_biggest_coalesce_batch_size(limit);
+        self
     }
 
     /// Return the schema of the output batches

@@ -309,6 +309,7 @@ impl HashJoinExecBuilder {
                 random_state: HASH_JOIN_SEED,
                 mode: PartitionMode::Auto,
                 fetch: None,
+                coalesce_batches: true,
                 metrics: ExecutionPlanMetricsSet::new(),
                 projection: None,
                 column_indices: vec![],
@@ -379,6 +380,12 @@ impl HashJoinExecBuilder {
     /// Set fetch property.
     pub fn with_fetch(mut self, fetch: Option<usize>) -> Self {
         self.exec.fetch = fetch;
+        self
+    }
+
+    /// Enable or disable output batch coalescing across probe batches.
+    pub fn with_coalesce_batches(mut self, coalesce_batches: bool) -> Self {
+        self.exec.coalesce_batches = coalesce_batches;
         self
     }
 
@@ -459,6 +466,7 @@ impl HashJoinExecBuilder {
             null_aware,
             dynamic_filter,
             fetch,
+            coalesce_batches,
             // Recomputed.
             join_schema: _,
             column_indices: _,
@@ -508,6 +516,7 @@ impl HashJoinExecBuilder {
             cache: Arc::new(cache),
             dynamic_filter,
             fetch,
+            coalesce_batches,
         })
     }
 
@@ -538,6 +547,7 @@ impl From<&HashJoinExec> for HashJoinExecBuilder {
                 cache: Arc::clone(&exec.cache),
                 dynamic_filter: exec.dynamic_filter.clone(),
                 fetch: exec.fetch,
+                coalesce_batches: exec.coalesce_batches,
             },
             preserve_properties: true,
         }
@@ -779,6 +789,13 @@ pub struct HashJoinExec {
     dynamic_filter: Option<HashJoinExecDynamicFilter>,
     /// Maximum number of rows to return
     fetch: Option<usize>,
+    /// Whether to coalesce output batches into `batch_size` chunks (default `true`).
+    /// When `false`, each probe batch's matches are emitted immediately without
+    /// buffering across probe batches.
+    ///
+    /// TODO(<https://github.com/apache/datafusion/issues/27109>): Coordinate with
+    /// `datafusion.execution.coalesce_batches` across operators using `LimitedBatchCoalescer`.
+    coalesce_batches: bool,
 }
 
 #[derive(Clone)]
@@ -973,6 +990,18 @@ impl HashJoinExec {
     /// Get null_equality
     pub fn null_equality(&self) -> NullEquality {
         self.null_equality
+    }
+
+    /// Returns whether output batches are coalesced into `batch_size` chunks.
+    pub fn coalesce_batches(&self) -> bool {
+        self.coalesce_batches
+    }
+
+    /// Returns a new [`HashJoinExec`] with output batch coalescing enabled or disabled.
+    pub fn with_coalesce_batches(&self, coalesce_batches: bool) -> Result<Self> {
+        self.builder()
+            .with_coalesce_batches(coalesce_batches)
+            .build()
     }
 
     /// Returns the dynamic filter expression produced by this hash join, if set.
@@ -1576,6 +1605,7 @@ impl ExecutionPlan for HashJoinExec {
             self.mode,
             self.null_aware,
             self.fetch,
+            self.coalesce_batches,
         )))
     }
 
@@ -1907,6 +1937,7 @@ impl ExecutionPlan for HashJoinExec {
                         null_aware: self.null_aware,
                         dynamic_filter,
                         fetch: self.fetch.map(|f| f as u64),
+                        coalesce_batches: Some(self.coalesce_batches),
                     },
                 )),
             ),
@@ -2019,6 +2050,8 @@ impl HashJoinExec {
             })
             .transpose()?;
 
+        let coalesce_batches = hashjoin.coalesce_batches.unwrap_or(true);
+
         let mut hash_join = HashJoinExecBuilder::new(left, right, on, join_type)
             .with_filter(filter)
             .with_projection(projection)
@@ -2026,6 +2059,7 @@ impl HashJoinExec {
             .with_null_equality(null_equality)
             .with_null_aware(hashjoin.null_aware)
             .with_fetch(fetch)
+            .with_coalesce_batches(coalesce_batches)
             .build()?;
 
         if let Some(dynamic_filter_proto) = &hashjoin.dynamic_filter {
@@ -7276,6 +7310,100 @@ mod tests {
             lit(true),
         ));
         assert!(join.with_dynamic_filter_expr(df).is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_hash_join_coalesce_batches() -> Result<()> {
+        let (_, _, on) = build_schema_and_on()?;
+        let left = build_table(
+            ("a1", &vec![1, 2, 3, 4]),
+            ("b1", &vec![1, 2, 3, 4]),
+            ("c1", &vec![10, 20, 30, 40]),
+        );
+        // Three probe batches: 2 matching rows, 2 non-matching rows (0 matches), 2 matching rows.
+        let right_batch_1 = build_table_i32(
+            ("a2", &vec![1, 2]),
+            ("b1", &vec![1, 2]),
+            ("c2", &vec![1, 2]),
+        );
+        let right_batch_2 = build_table_i32(
+            ("a2", &vec![9, 9]),
+            ("b1", &vec![9, 9]),
+            ("c2", &vec![9, 9]),
+        );
+        let right_batch_3 = build_table_i32(
+            ("a2", &vec![3, 4]),
+            ("b1", &vec![3, 4]),
+            ("c2", &vec![3, 4]),
+        );
+        let right_schema = right_batch_1.schema();
+        let right: Arc<dyn ExecutionPlan> = TestMemoryExec::try_new_exec(
+            &[vec![right_batch_1, right_batch_2, right_batch_3]],
+            right_schema,
+            None,
+        )?;
+
+        let task_ctx = Arc::new(
+            TaskContext::default()
+                .with_session_config(SessionConfig::new().with_batch_size(8192)),
+        );
+
+        let default_join = HashJoinExec::try_new(
+            Arc::clone(&left),
+            Arc::clone(&right),
+            on.clone(),
+            None,
+            &JoinType::Inner,
+            None,
+            PartitionMode::CollectLeft,
+            NullEquality::NullEqualsNothing,
+            false,
+        )?;
+        assert!(default_join.coalesce_batches());
+        let coalesced_batches =
+            common::collect(default_join.execute(0, Arc::clone(&task_ctx))?).await?;
+        let coalesced_counts: Vec<usize> = coalesced_batches
+            .iter()
+            .map(RecordBatch::num_rows)
+            .collect();
+        assert_eq!(coalesced_counts, vec![4]);
+
+        let uncoalesced_join = HashJoinExec::try_new(
+            Arc::clone(&left),
+            Arc::clone(&right),
+            on,
+            None,
+            &JoinType::Inner,
+            None,
+            PartitionMode::CollectLeft,
+            NullEquality::NullEqualsNothing,
+            false,
+        )?
+        .with_coalesce_batches(false)?;
+        assert!(!uncoalesced_join.coalesce_batches());
+        let uncoalesced_batches =
+            common::collect(uncoalesced_join.execute(0, Arc::clone(&task_ctx))?).await?;
+        let uncoalesced_counts: Vec<usize> = uncoalesced_batches
+            .iter()
+            .map(RecordBatch::num_rows)
+            .collect();
+        assert_eq!(uncoalesced_counts, vec![2, 2]);
+
+        let limited_plan = Arc::new(uncoalesced_join)
+            .reset_state()?
+            .with_fetch(Some(3))
+            .expect("HashJoinExec supports fetch");
+        assert!(
+            !limited_plan
+                .downcast_ref::<HashJoinExec>()
+                .unwrap()
+                .coalesce_batches()
+        );
+        let limited_batches = common::collect(limited_plan.execute(0, task_ctx)?).await?;
+        let limited_counts: Vec<usize> =
+            limited_batches.iter().map(RecordBatch::num_rows).collect();
+        assert_eq!(limited_counts, vec![2, 1]);
         Ok(())
     }
 }

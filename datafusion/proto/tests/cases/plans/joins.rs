@@ -167,7 +167,12 @@ fn roundtrip_hash_join_fetch() -> Result<()> {
     // is simply `u32::MAX`), so this stays portable. The truncating case
     // itself -- a `u64` fetch above `usize::MAX` -- is only reachable on a
     // 32-bit target and so is not exercised by this test on a 64-bit host.
-    for fetch in [None, Some(7), Some(u32::MAX as usize), Some(usize::MAX)] {
+    for (fetch, coalesce_batches) in [
+        (None, true),
+        (Some(7), false),
+        (Some(u32::MAX as usize), true),
+        (Some(usize::MAX), false),
+    ] {
         let join = HashJoinExec::try_new(
             Arc::new(EmptyExec::new(Arc::clone(&schema_left))),
             Arc::new(EmptyExec::new(Arc::clone(&schema_right))),
@@ -178,7 +183,8 @@ fn roundtrip_hash_join_fetch() -> Result<()> {
             PartitionMode::Partitioned,
             NullEquality::NullEqualsNothing,
             false,
-        )?;
+        )?
+        .with_coalesce_batches(coalesce_batches)?;
 
         let plan: Arc<dyn ExecutionPlan> = match fetch {
             // This is how `limit_pushdown` installs the limit.
@@ -199,6 +205,7 @@ fn roundtrip_hash_join_fetch() -> Result<()> {
             .downcast_ref::<HashJoinExec>()
             .expect("should be a HashJoinExec");
         assert_eq!(deserialized_join.fetch(), fetch);
+        assert_eq!(deserialized_join.coalesce_batches(), coalesce_batches);
     }
     Ok(())
 }

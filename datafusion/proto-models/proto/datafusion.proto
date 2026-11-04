@@ -1339,6 +1339,10 @@ message HashJoinExecNode {
   // turning old plans into empty results. With `optional`, absent decodes to
   // `None`, which is the correct reading of an older message.
   optional uint64 fetch = 12;
+  // Whether to coalesce output batches across probe batches. Marked `optional`
+  // so that older messages without this field decode to `None` and default to
+  // `true` rather than proto3's implicit `false`.
+  optional bool coalesce_batches = 13;
 }
 
 enum StreamPartitionMode {
