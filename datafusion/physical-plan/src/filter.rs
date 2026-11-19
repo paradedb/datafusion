@@ -28,7 +28,9 @@ use crate::projection::{
     EmbeddedProjection, ProjectionExec, ProjectionExpr, make_with_child,
     try_embed_projection, update_expr,
 };
-use crate::statistics::{ChildStats, StatisticsArgs, StatisticsContext};
+use crate::statistics::{
+    ChildStats, PartitionStatsMode, StatisticsArgs, StatisticsContext,
+};
 use crate::stream::EmptyRecordBatchStream;
 use crate::{ChildrenPropertiesMode, ReplaceChildrenOptions, validate_child_count};
 use crate::{
@@ -360,6 +362,17 @@ impl FilterExec {
         predicate: &Arc<dyn PhysicalExpr>,
         default_selectivity: u8,
     ) -> Result<Statistics> {
+        if input_stats.num_rows == Precision::Exact(0) {
+            return Ok(Statistics {
+                num_rows: Precision::Exact(0),
+                total_byte_size: Precision::Exact(0),
+                column_statistics: vec![
+                    empty_column_statistics();
+                    input_stats.column_statistics.len()
+                ],
+                ..Default::default()
+            });
+        }
         let null_check = null_check_column(predicate);
         if let Some((column, is_null)) = null_check
             && let Some(num_rows) = null_check_num_rows(&input_stats, column, is_null)
@@ -764,6 +777,10 @@ impl ExecutionPlan for FilterExec {
 
     fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {
         vec![ChildStats::At(partition)]
+    }
+
+    fn partition_stats_mode(&self) -> PartitionStatsMode {
+        PartitionStatsMode::ElementwiseFromChildren
     }
 
     /// The output statistics of a filtering operation can be estimated if the

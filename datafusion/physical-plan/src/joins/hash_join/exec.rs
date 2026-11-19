@@ -41,7 +41,9 @@ use crate::projection::{
     try_pushdown_through_join_with_column_indices,
 };
 use crate::repartition::REPARTITION_RANDOM_STATE;
-use crate::statistics::{ChildStats, StatisticsArgs, with_per_partition_fetch};
+use crate::statistics::{
+    ChildStats, PartitionStatsMode, StatisticsArgs, with_per_partition_fetch,
+};
 use crate::{
     ChildrenPropertiesMode, ExecutionPlanProperties, ReplaceChildrenOptions,
     validate_child_count,
@@ -1876,6 +1878,14 @@ impl ExecutionPlan for HashJoinExec {
             (Some(_), PartitionMode::Auto) => {
                 vec![ChildStats::At(None), ChildStats::At(None)]
             }
+        }
+    }
+
+    fn partition_stats_mode(&self) -> PartitionStatsMode {
+        if self.mode == PartitionMode::Partitioned {
+            PartitionStatsMode::ElementwiseFromChildren
+        } else {
+            PartitionStatsMode::PerPartitionIndex
         }
     }
 

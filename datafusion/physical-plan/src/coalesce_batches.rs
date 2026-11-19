@@ -11,7 +11,9 @@ use std::task::{Context, Poll};
 use super::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use super::{DisplayAs, ExecutionPlanProperties, PlanProperties, Statistics};
 use crate::projection::ProjectionExec;
-use crate::statistics::{ChildStats, StatisticsArgs, with_per_partition_fetch};
+use crate::statistics::{
+    ChildStats, PartitionStatsMode, StatisticsArgs, with_per_partition_fetch,
+};
 use crate::stream::EmptyRecordBatchStream;
 use crate::{
     ChildrenPropertiesMode, DisplayFormatType, ExecutionPlan, RecordBatchStream,
@@ -228,6 +230,10 @@ impl ExecutionPlan for CoalesceBatchesExec {
 
     fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {
         vec![ChildStats::At(partition)]
+    }
+
+    fn partition_stats_mode(&self) -> PartitionStatsMode {
+        PartitionStatsMode::ElementwiseFromChildren
     }
 
     fn statistics_from_inputs(

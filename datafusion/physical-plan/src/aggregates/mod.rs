@@ -158,7 +158,7 @@ use crate::filter_pushdown::{
     FilterPushdownPropagation,
 };
 use crate::metrics::{ExecutionPlanMetricsSet, MetricsSet};
-use crate::statistics::{ChildStats, StatisticsArgs};
+use crate::statistics::{ChildStats, PartitionStatsMode, StatisticsArgs};
 use crate::{ChildrenPropertiesMode, ReplaceChildrenOptions, validate_child_count};
 use crate::{
     DisplayFormatType, Distribution, ExecutionPlan, InputDistributionRequirements,
@@ -2309,6 +2309,10 @@ impl ExecutionPlan for AggregateExec {
 
     fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {
         vec![ChildStats::At(partition)]
+    }
+
+    fn partition_stats_mode(&self) -> PartitionStatsMode {
+        PartitionStatsMode::ElementwiseFromChildren
     }
 
     fn statistics_from_inputs(

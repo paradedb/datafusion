@@ -26,7 +26,7 @@ use crate::projection::{ProjectionExec, all_columns, make_with_child, update_exp
 use crate::sorts::streaming_merge::StreamingMergeBuilder;
 use crate::spill::spill_manager::SpillManager;
 use crate::spill::spill_pool::{self, SpillPoolSink, SpillPoolWriter};
-use crate::statistics::{ChildStats, StatisticsArgs};
+use crate::statistics::{ChildStats, StatisticsArgs, StatisticsContext};
 use crate::stream::{EmptyRecordBatchStream, RecordBatchStreamAdapter};
 use crate::{
     ChildrenPropertiesMode, DisplayFormatType, ExecutionPlan, Partitioning,
@@ -414,9 +414,26 @@ impl RepartitionExecState {
         }
 
         let num_input_partitions = input.output_partitioning().partition_count();
-        let mut streams_and_metrics = Vec::with_capacity(num_input_partitions);
+        let partition_stats = if elide_empty_inputs_enabled() {
+            Some(StatisticsContext::new().compute_partitions(input.as_ref())?)
+        } else {
+            None
+        };
+        let capacity = match &partition_stats {
+            Some(stats) => stats
+                .iter()
+                .filter(|s| s.num_rows != Precision::Exact(0))
+                .count(),
+            None => num_input_partitions,
+        };
+        let mut streams_and_metrics = Vec::with_capacity(capacity);
 
         for i in 0..num_input_partitions {
+            if let Some(stats) = &partition_stats
+                && stats[i].num_rows == Precision::Exact(0)
+            {
+                continue;
+            }
             let metrics = RepartitionMetrics::new(i, output_partitions, metrics);
 
             let timer = metrics.fetch_time.timer();
@@ -5325,6 +5342,416 @@ mod test {
 
         Ok(())
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn bench_empty_partition_sweep() -> Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Instant;
+
+        use arrow::array::Int64Array;
+        use arrow::datatypes::Field;
+        use datafusion_common::NullEquality;
+        use datafusion_expr::{JoinType, Operator};
+        use datafusion_physical_expr::expressions::{BinaryExpr, col, lit};
+
+        use crate::coalesce_partitions::CoalescePartitionsExec;
+        use crate::execution_plan::{Boundedness, EmissionType};
+        use crate::filter::FilterExec;
+        use crate::joins::{HashJoinExec, PartitionMode};
+        use crate::memory::MemoryStream;
+
+        #[derive(Debug)]
+        struct SlicedRangeSourceExec {
+            schema: SchemaRef,
+            partitions: Vec<Vec<RecordBatch>>,
+            partition_stats: Vec<Arc<Statistics>>,
+            overall_stats: Arc<Statistics>,
+            cache: Arc<PlanProperties>,
+            executed_count: Arc<AtomicUsize>,
+        }
+
+        impl DisplayAs for SlicedRangeSourceExec {
+            fn fmt_as(
+                &self,
+                _t: DisplayFormatType,
+                f: &mut Formatter,
+            ) -> std::fmt::Result {
+                write!(f, "SlicedRangeSourceExec")
+            }
+        }
+
+        impl ExecutionPlan for SlicedRangeSourceExec {
+            fn name(&self) -> &'static str {
+                "SlicedRangeSourceExec"
+            }
+
+            fn properties(&self) -> &Arc<PlanProperties> {
+                &self.cache
+            }
+
+            fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+                vec![]
+            }
+
+            fn apply_expressions(
+                &self,
+                _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+            ) -> Result<TreeNodeRecursion> {
+                Ok(TreeNodeRecursion::Continue)
+            }
+
+            fn with_new_children(
+                self: Arc<Self>,
+                _children: Vec<Arc<dyn ExecutionPlan>>,
+            ) -> Result<Arc<dyn ExecutionPlan>> {
+                Ok(self)
+            }
+
+            fn execute(
+                &self,
+                partition: usize,
+                _context: Arc<TaskContext>,
+            ) -> Result<SendableRecordBatchStream> {
+                self.executed_count.fetch_add(1, Ordering::Relaxed);
+                Ok(Box::pin(MemoryStream::try_new(
+                    self.partitions[partition].clone(),
+                    Arc::clone(&self.schema),
+                    None,
+                )?))
+            }
+
+            fn statistics_from_inputs(
+                &self,
+                _input_stats: &[Arc<Statistics>],
+                args: &StatisticsArgs,
+            ) -> Result<Arc<Statistics>> {
+                match args.partition() {
+                    Some(idx) => Ok(Arc::clone(&self.partition_stats[idx])),
+                    None => Ok(Arc::clone(&self.overall_stats)),
+                }
+            }
+        }
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Int64, false),
+        ]));
+        let active_per_worker = 16usize;
+        let rows_per_active_partition = 4096usize;
+
+        let build_pipeline =
+            |n_total: usize| -> Result<(Arc<dyn ExecutionPlan>, Arc<AtomicUsize>)> {
+                let executed_count = Arc::new(AtomicUsize::new(0));
+                let stride = n_total / active_per_worker;
+                let build_side =
+                    |exec_counter: &Arc<AtomicUsize>| -> Result<Arc<dyn ExecutionPlan>> {
+                        let mut partitions = Vec::with_capacity(n_total);
+                        let mut partition_stats = Vec::with_capacity(n_total);
+                        let empty_stats = Arc::new(
+                            Statistics::new_unknown(&schema)
+                                .with_num_rows(Precision::Exact(0))
+                                .with_total_byte_size(Precision::Exact(0)),
+                        );
+                        // Place the 16 active partitions non-contiguously across 0..n_total
+                        // (`p % stride == 0`), each with its own distinct `Arc<Statistics>`
+                        // and per-partition extrema.
+                        let mut active_placed = 0usize;
+                        for p in 0..n_total {
+                            if p % stride == 0 && active_placed < active_per_worker {
+                                active_placed += 1;
+                                let base = (p * 10_000) as i64;
+                                let a_vals: Vec<i64> = (0..rows_per_active_partition
+                                    as i64)
+                                    .map(|k| base + (k % 1000))
+                                    .collect();
+                                let b_vals: Vec<i64> =
+                                    (1..=rows_per_active_partition as i64).collect();
+                                let batch = RecordBatch::try_new(
+                                    Arc::clone(&schema),
+                                    vec![
+                                        Arc::new(Int64Array::from(a_vals)),
+                                        Arc::new(Int64Array::from(b_vals)),
+                                    ],
+                                )?;
+                                partitions.push(vec![batch]);
+                                partition_stats.push(Arc::new(Statistics {
+                                    num_rows: Precision::Exact(rows_per_active_partition),
+                                    total_byte_size: Precision::Exact(
+                                        rows_per_active_partition * 16,
+                                    ),
+                                    column_statistics: vec![
+                                        ColumnStatistics {
+                                            null_count: Precision::Exact(0),
+                                            min_value: Precision::Exact(
+                                                ScalarValue::Int64(Some(base)),
+                                            ),
+                                            max_value: Precision::Exact(
+                                                ScalarValue::Int64(Some(base + 999)),
+                                            ),
+                                            distinct_count: Precision::Exact(1000),
+                                            ..ColumnStatistics::new_unknown()
+                                        },
+                                        ColumnStatistics {
+                                            null_count: Precision::Exact(0),
+                                            min_value: Precision::Exact(
+                                                ScalarValue::Int64(Some(1)),
+                                            ),
+                                            max_value: Precision::Exact(
+                                                ScalarValue::Int64(Some(
+                                                    rows_per_active_partition as i64,
+                                                )),
+                                            ),
+                                            distinct_count: Precision::Exact(
+                                                rows_per_active_partition,
+                                            ),
+                                            ..ColumnStatistics::new_unknown()
+                                        },
+                                    ],
+                                }));
+                            } else {
+                                partitions.push(vec![]);
+                                partition_stats.push(Arc::clone(&empty_stats));
+                            }
+                        }
+                        assert_eq!(active_placed, active_per_worker);
+
+                        let split_points: Vec<SplitPoint> = (1..n_total)
+                            .map(|p| {
+                                SplitPoint::new(vec![ScalarValue::Int64(Some(
+                                    (p * 10_000) as i64,
+                                ))])
+                            })
+                            .collect();
+                        let ordering: LexOrdering = [PhysicalSortExpr::new(
+                            col("a", &schema)?,
+                            SortOptions::default(),
+                        )]
+                        .into();
+                        let partitioning = Partitioning::Range(
+                            RangePartitioning::try_new(ordering, split_points)?,
+                        );
+                        let cache = Arc::new(PlanProperties::new(
+                            EquivalenceProperties::new(Arc::clone(&schema)),
+                            partitioning,
+                            EmissionType::Incremental,
+                            Boundedness::Bounded,
+                        ));
+                        let overall_stats =
+                            Arc::new(Statistics::new_unknown(&schema).with_num_rows(
+                                Precision::Exact(
+                                    active_per_worker * rows_per_active_partition,
+                                ),
+                            ));
+                        let leaf: Arc<dyn ExecutionPlan> =
+                            Arc::new(SlicedRangeSourceExec {
+                                schema: Arc::clone(&schema),
+                                partitions,
+                                partition_stats,
+                                overall_stats,
+                                cache,
+                                executed_count: Arc::clone(exec_counter),
+                            });
+                        let pred: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+                            col("b", &schema)?,
+                            Operator::Gt,
+                            lit(0i64),
+                        ));
+                        let filter: Arc<dyn ExecutionPlan> =
+                            Arc::new(FilterExec::try_new(pred, leaf)?);
+                        let proj: Arc<dyn ExecutionPlan> =
+                            Arc::new(ProjectionExec::try_new(
+                                vec![
+                                    (col("a", &schema)?, "a".to_string()),
+                                    (col("b", &schema)?, "b".to_string()),
+                                ],
+                                filter,
+                            )?);
+                        Ok(proj)
+                    };
+
+                let left = build_side(&executed_count)?;
+                let right = build_side(&executed_count)?;
+                let join: Arc<dyn ExecutionPlan> = Arc::new(HashJoinExec::try_new(
+                    left,
+                    right,
+                    vec![(col("a", &schema)?, col("a", &schema)?)],
+                    None,
+                    &JoinType::Inner,
+                    None,
+                    PartitionMode::Partitioned,
+                    NullEquality::NullEqualsNothing,
+                    false,
+                )?);
+                Ok((join, executed_count))
+            };
+
+        let median_ms = |mut samples: Vec<f64>| -> f64 {
+            samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            samples[samples.len() / 2]
+        };
+
+        let task_ctx = Arc::new(TaskContext::default());
+        let runs = 5usize;
+
+        println!(
+            "\n| N (total) | Empty | Stats loop / batch (ms) | Coalesce N->1 no-elide / elide (ms) | Repart N->16 no-elide / elide (ms) | Repart N->N no-elide / elide (ms) | Leaf .execute() calls (no-elide -> elide) |"
+        );
+        println!("|---:|---:|---:|---:|---:|---:|---:|");
+
+        for n_total in [16usize, 160, 800, 1600] {
+            let (base_plan, _) = build_pipeline(n_total)?;
+
+            let mut stats_loop_times = Vec::with_capacity(runs);
+            let mut stats_batch_times = Vec::with_capacity(runs);
+            for r in 0..=runs {
+                let t0 = Instant::now();
+                let ctx = StatisticsContext::new();
+                let mut empty_found = 0usize;
+                for i in 0..n_total {
+                    let s = ctx.compute(
+                        base_plan.as_ref(),
+                        &StatisticsArgs::new().with_partition(Some(i)),
+                    )?;
+                    if s.num_rows == Precision::Exact(0) {
+                        empty_found += 1;
+                    }
+                }
+                assert_eq!(empty_found, n_total - active_per_worker);
+                if r > 0 {
+                    stats_loop_times.push(t0.elapsed().as_secs_f64() * 1000.0);
+                }
+
+                let t1 = Instant::now();
+                let parts =
+                    StatisticsContext::new().compute_partitions(base_plan.as_ref())?;
+                let empty_batch = parts
+                    .iter()
+                    .filter(|s| s.num_rows == Precision::Exact(0))
+                    .count();
+                assert_eq!(empty_batch, n_total - active_per_worker);
+                if r > 0 {
+                    stats_batch_times.push(t1.elapsed().as_secs_f64() * 1000.0);
+                }
+            }
+
+            async fn drain_plan(
+                plan: Arc<dyn ExecutionPlan>,
+                task_ctx: &Arc<TaskContext>,
+            ) -> Result<usize> {
+                let out_p = plan.properties().output_partitioning().partition_count();
+                let mut join_set = tokio::task::JoinSet::new();
+                for p in 0..out_p {
+                    let mut stream = plan.execute(p, Arc::clone(task_ctx))?;
+                    join_set.spawn(async move {
+                        let mut rows = 0usize;
+                        while let Some(b) = stream.next().await {
+                            rows += b?.num_rows();
+                        }
+                        Ok::<usize, DataFusionError>(rows)
+                    });
+                }
+                let mut total = 0usize;
+                while let Some(res) = join_set.join_next().await {
+                    total += res.unwrap()?;
+                }
+                Ok(total)
+            }
+
+            let mut coal_times = [Vec::new(), Vec::new()];
+            let mut exec_calls = [0usize; 2];
+            for (idx, elide) in [false, true].into_iter().enumerate() {
+                ELIDE_EMPTY_INPUT_PARTITIONS.store(elide, Ordering::SeqCst);
+                for r in 0..=runs {
+                    let (join, counter) = build_pipeline(n_total)?;
+                    let coal: Arc<dyn ExecutionPlan> =
+                        Arc::new(CoalescePartitionsExec::new(join));
+                    let t0 = Instant::now();
+                    let rows = drain_plan(coal, &task_ctx).await?;
+                    assert!(rows > 0);
+                    if r > 0 {
+                        coal_times[idx].push(t0.elapsed().as_secs_f64() * 1000.0);
+                        exec_calls[idx] = counter.load(Ordering::Relaxed);
+                    }
+                }
+            }
+
+            let mut rep16_times = [Vec::new(), Vec::new()];
+            for (idx, elide) in [false, true].into_iter().enumerate() {
+                ELIDE_EMPTY_INPUT_PARTITIONS.store(elide, Ordering::SeqCst);
+                for r in 0..=runs {
+                    let (join, _) = build_pipeline(n_total)?;
+                    let join_schema = join.schema();
+                    let rep: Arc<dyn ExecutionPlan> = Arc::new(RepartitionExec::try_new(
+                        join,
+                        Partitioning::Hash(vec![col("a", &join_schema)?], 16),
+                    )?);
+                    let t0 = Instant::now();
+                    let rows = drain_plan(rep, &task_ctx).await?;
+                    assert!(rows > 0);
+                    if r > 0 {
+                        rep16_times[idx].push(t0.elapsed().as_secs_f64() * 1000.0);
+                    }
+                }
+            }
+
+            let mut rep_nn_times = [Vec::new(), Vec::new()];
+            let r_nn_runs = if n_total >= 1600 { 3 } else { runs };
+            for (idx, elide) in [false, true].into_iter().enumerate() {
+                ELIDE_EMPTY_INPUT_PARTITIONS.store(elide, Ordering::SeqCst);
+                for r in 0..=r_nn_runs {
+                    let (join, _) = build_pipeline(n_total)?;
+                    let join_schema = join.schema();
+                    let splits: Vec<SplitPoint> = (1..n_total)
+                        .map(|p| {
+                            SplitPoint::new(vec![ScalarValue::Int64(Some(
+                                (p * 10_000 + 500) as i64,
+                            ))])
+                        })
+                        .collect();
+                    let ord: LexOrdering = [PhysicalSortExpr::new(
+                        col("a", &join_schema)?,
+                        SortOptions::default(),
+                    )]
+                    .into();
+                    let rep: Arc<dyn ExecutionPlan> = Arc::new(RepartitionExec::try_new(
+                        join,
+                        Partitioning::Range(RangePartitioning::try_new(ord, splits)?),
+                    )?);
+                    let t0 = Instant::now();
+                    let rows = drain_plan(rep, &task_ctx).await?;
+                    assert!(rows > 0);
+                    if r > 0 {
+                        rep_nn_times[idx].push(t0.elapsed().as_secs_f64() * 1000.0);
+                    }
+                }
+            }
+            ELIDE_EMPTY_INPUT_PARTITIONS.store(false, Ordering::SeqCst);
+
+            println!(
+                "| {n_total} | {} | {:.2} / {:.3} | {:.2} / {:.2} | {:.2} / {:.2} | {:.2} / {:.2} | {} -> {} |",
+                n_total - active_per_worker,
+                median_ms(stats_loop_times),
+                median_ms(stats_batch_times),
+                median_ms(coal_times[0].clone()),
+                median_ms(coal_times[1].clone()),
+                median_ms(rep16_times[0].clone()),
+                median_ms(rep16_times[1].clone()),
+                median_ms(rep_nn_times[0].clone()),
+                median_ms(rep_nn_times[1].clone()),
+                exec_calls[0],
+                exec_calls[1],
+            );
+        }
+
+        Ok(())
+    }
+}
+
+pub(crate) static ELIDE_EMPTY_INPUT_PARTITIONS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn elide_empty_inputs_enabled() -> bool {
+    ELIDE_EMPTY_INPUT_PARTITIONS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 #[cfg(all(test, feature = "proto"))]

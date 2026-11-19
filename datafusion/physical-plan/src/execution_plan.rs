@@ -39,7 +39,7 @@ use crate::metrics::MetricsSet;
 use crate::projection::ProjectionExec;
 use crate::repartition::RepartitionExec;
 use crate::sorts::sort_preserving_merge::SortPreservingMergeExec;
-use crate::statistics::{ChildStats, StatisticsArgs};
+use crate::statistics::{ChildStats, PartitionStatsMode, StatisticsArgs};
 use crate::stream::RecordBatchStreamAdapter;
 
 use arrow::array::{Array, RecordBatch};
@@ -764,6 +764,17 @@ pub trait ExecutionPlan: Any + Debug + DisplayAs + Send + Sync {
     /// [`StatisticsContext`]: crate::statistics::StatisticsContext
     fn child_stats_requests(&self, _partition: Option<usize>) -> Vec<ChildStats> {
         self.children().iter().map(|_| ChildStats::Skip).collect()
+    }
+
+    /// Declares whether [`StatisticsContext::compute_partitions`] must evaluate
+    /// each partition index individually ([`PartitionStatsMode::PerPartitionIndex`],
+    /// the default) or may evaluate all partitions elementwise from child
+    /// partitions and reuse outputs when child `Arc<Statistics>` match
+    /// ([`PartitionStatsMode::ElementwiseFromChildren`]).
+    ///
+    /// [`StatisticsContext::compute_partitions`]: crate::statistics::StatisticsContext::compute_partitions
+    fn partition_stats_mode(&self) -> PartitionStatsMode {
+        PartitionStatsMode::PerPartitionIndex
     }
 
     /// Returns `true` if a limit can be safely pushed down through this

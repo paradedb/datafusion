@@ -20,7 +20,7 @@ use crate::filter_pushdown::{
     FilterPushdownPropagation, FilterRemapper, PushedDownPredicate,
 };
 use crate::joins::utils::{ColumnIndex, JoinFilter, JoinOn, JoinOnRef};
-use crate::statistics::{ChildStats, StatisticsArgs};
+use crate::statistics::{ChildStats, PartitionStatsMode, StatisticsArgs};
 use crate::{
     ChildrenPropertiesMode, DisplayFormatType, ExecutionPlan, PhysicalExpr,
     ReplaceChildrenOptions, validate_child_count,
@@ -470,6 +470,10 @@ impl ExecutionPlan for ProjectionExec {
 
     fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {
         vec![ChildStats::At(partition)]
+    }
+
+    fn partition_stats_mode(&self) -> PartitionStatsMode {
+        PartitionStatsMode::ElementwiseFromChildren
     }
 
     fn statistics_from_inputs(

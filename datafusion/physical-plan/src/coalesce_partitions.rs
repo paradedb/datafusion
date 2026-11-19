@@ -248,12 +248,28 @@ impl ExecutionPlan for CoalescePartitionsExec {
                 // use a stream that allows each sender to put in at
                 // least one result in an attempt to maximize
                 // parallelism.
-                let mut builder =
-                    RecordBatchReceiverStream::builder(self.schema(), input_partitions);
+                let active_partitions: Vec<usize> =
+                    if crate::repartition::elide_empty_inputs_enabled() {
+                        let stats = crate::statistics::StatisticsContext::new()
+                            .compute_partitions(self.input.as_ref())?;
+                        (0..input_partitions)
+                            .filter(|&part_i| {
+                                stats[part_i].num_rows
+                                    != datafusion_common::stats::Precision::Exact(0)
+                            })
+                            .collect()
+                    } else {
+                        (0..input_partitions).collect()
+                    };
+
+                let mut builder = RecordBatchReceiverStream::builder(
+                    self.schema(),
+                    active_partitions.len().max(1),
+                );
 
                 // spawn independent tasks whose resulting streams (of batches)
                 // are sent to the channel for consumption.
-                for part_i in 0..input_partitions {
+                for part_i in active_partitions {
                     builder.run_input(
                         Arc::clone(&self.input),
                         part_i,

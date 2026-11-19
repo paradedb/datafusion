@@ -34,7 +34,9 @@ use crate::sorts::streaming_merge::{SortedSpillFile, StreamingMergeBuilder};
 use crate::spill::get_record_batch_memory_size;
 use crate::spill::in_progress_spill_file::InProgressSpillFile;
 use crate::spill::spill_manager::{GetSlicedSize, SpillManager};
-use crate::statistics::{ChildStats, StatisticsArgs, with_per_partition_fetch};
+use crate::statistics::{
+    ChildStats, PartitionStatsMode, StatisticsArgs, with_per_partition_fetch,
+};
 use crate::stream::{ObservedStream, RecordBatchStreamAdapter};
 use crate::topk::TopK;
 use crate::topk::TopKDynamicFilters;
@@ -1867,6 +1869,14 @@ impl ExecutionPlan for SortExec {
             None
         };
         vec![ChildStats::At(child_partition)]
+    }
+
+    fn partition_stats_mode(&self) -> PartitionStatsMode {
+        if self.preserve_partitioning() {
+            PartitionStatsMode::ElementwiseFromChildren
+        } else {
+            PartitionStatsMode::PerPartitionIndex
+        }
     }
 
     fn statistics_from_inputs(

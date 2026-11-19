@@ -15,28 +15,29 @@ use crate::operator_statistics::{
 use datafusion_common::extensions::Extensions;
 use datafusion_common::stats::Precision;
 use datafusion_common::{
-    Result, Statistics, assert_eq_or_internal_err, assert_or_internal_err,
+    HashMap, Result, Statistics, assert_eq_or_internal_err, assert_or_internal_err,
 };
 use log::debug;
 use parking_lot::Mutex;
-use std::collections::HashMap;
 use std::ptr::from_ref;
 use std::sync::Arc;
 
 type CacheKey = (usize, Option<usize>);
 
+fn plan_addr(plan: &dyn ExecutionPlan) -> usize {
+    from_ref::<dyn ExecutionPlan>(plan).cast::<()>() as usize
+}
+
 fn cache_key(plan: &dyn ExecutionPlan, partition: Option<usize>) -> CacheKey {
-    (
-        from_ref::<dyn ExecutionPlan>(plan).cast::<()>() as usize,
-        partition,
-    )
+    (plan_addr(plan), partition)
 }
 
 /// Per-context memoization cache for statistics computation.
 ///
-/// Keys are `(plan node pointer address, partition)`. Every entry retains the
-/// `Arc` whose pointer supplied its key, preventing a dropped plan's address
-/// from being reused by a different plan while the entry exists.
+/// Keys are `(plan node pointer address, partition)` (or `plan node pointer
+/// address` for all-partition slices). Every entry retains the `Arc` whose
+/// pointer supplied its key, preventing a dropped plan's address from being
+/// reused by a different plan while the entry exists.
 ///
 /// Core statistics and provider extensions are cached separately: the
 /// `statistics` map is the hot path (populated on every walk); the `extensions`
@@ -51,6 +52,7 @@ struct CacheEntry<T> {
 #[derive(Debug, Default)]
 struct StatsCache {
     statistics: HashMap<CacheKey, CacheEntry<Arc<Statistics>>>,
+    partition_statistics: HashMap<usize, CacheEntry<Arc<[Arc<Statistics>]>>>,
     extensions: HashMap<CacheKey, CacheEntry<Extensions>>,
 }
 
@@ -137,6 +139,21 @@ pub enum ChildStats {
     Skip,
 }
 
+/// Declares how [`StatisticsContext::compute_partitions`] may evaluate a plan
+/// node's per-partition statistics across `0..partition_count`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartitionStatsMode {
+    /// Resolve each partition via [`ExecutionPlan::child_stats_requests`] and
+    /// invoke [`ExecutionPlan::statistics_from_inputs`] per partition index.
+    PerPartitionIndex,
+    /// Output partition `i` reads partition `i` of every child and its
+    /// [`ExecutionPlan::statistics_from_inputs`] depends only on `input_stats`
+    /// and `args.partition().is_some()` (never the numeric value of `i`),
+    /// allowing batch child resolution and pointer-based deduplication across
+    /// partitions sharing identical child `Arc<Statistics>`.
+    ElementwiseFromChildren,
+}
+
 /// Owns the bottom-up traversal and memoization cache for statistics
 /// computation. Call [`StatisticsContext::compute`] to walk a plan tree.
 ///
@@ -200,6 +217,7 @@ impl StatisticsContext {
     pub fn reset_cache(&self) {
         let mut cache = self.cache.lock();
         cache.statistics.clear();
+        cache.partition_statistics.clear();
         cache.extensions.clear();
     }
 
@@ -295,6 +313,57 @@ impl StatisticsContext {
     ) -> Result<Arc<Statistics>> {
         self.compute_base(plan.as_ref(), Some(plan), args, false)
             .map(|(statistics, _)| statistics)
+    }
+
+    /// Computes core [`Statistics`] for all `0..partition_count` output
+    /// partitions of `plan` in a single bottom-up walk.
+    ///
+    /// Operators returning [`PartitionStatsMode::ElementwiseFromChildren`] from
+    /// [`ExecutionPlan::partition_stats_mode`] resolve their children once and
+    /// reuse outputs across partitions whose child `Arc<Statistics>` pointers
+    /// match (for example when many partitions share a known-empty `Exact(0)`
+    /// [`Statistics`] allocation).
+    ///
+    /// As with [`Self::compute`], the borrowed root is not memoized; use
+    /// [`Self::compute_partitions_arc`] to also memoize the root slice.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use arrow::datatypes::{DataType, Field, Schema};
+    /// # use datafusion_common::Statistics;
+    /// # use datafusion_common::stats::Precision;
+    /// # use datafusion_physical_plan::statistics::StatisticsContext;
+    /// # use datafusion_physical_plan::test::exec::StatisticsExec;
+    ///
+    /// let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
+    /// let overall = Statistics::new_unknown(&schema).with_num_rows(Precision::Exact(60));
+    /// let per_part = vec![
+    ///     Statistics::new_unknown(&schema).with_num_rows(Precision::Exact(60)),
+    ///     Statistics::new_unknown(&schema).with_num_rows(Precision::Exact(0)),
+    /// ];
+    /// let plan = StatisticsExec::new(overall, schema).with_partition_statistics(per_part);
+    ///
+    /// let parts = StatisticsContext::new().compute_partitions(&plan)?;
+    /// assert_eq!(parts.len(), 2);
+    /// assert_eq!(parts[0].num_rows, Precision::Exact(60));
+    /// assert_eq!(parts[1].num_rows, Precision::Exact(0));
+    /// # Ok::<(), datafusion_common::DataFusionError>(())
+    /// ```
+    pub fn compute_partitions(
+        &self,
+        plan: &dyn ExecutionPlan,
+    ) -> Result<Arc<[Arc<Statistics>]>> {
+        self.compute_partitions_base(plan, None)
+    }
+
+    /// Like [`Self::compute_partitions`], retaining `plan` so the root's
+    /// per-partition slice is memoized as well as its descendants'.
+    pub fn compute_partitions_arc(
+        &self,
+        plan: &Arc<dyn ExecutionPlan>,
+    ) -> Result<Arc<[Arc<Statistics>]>> {
+        self.compute_partitions_base(plan.as_ref(), Some(plan))
     }
 
     /// Computes the [`ExtendedStatistics`] for `plan`: the core statistics plus
@@ -626,16 +695,217 @@ impl StatisticsContext {
             .collect()
     }
 
+    fn compute_partitions_base(
+        &self,
+        plan: &dyn ExecutionPlan,
+        retained_plan: Option<&Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<[Arc<Statistics>]>> {
+        if let Some(cached) = self.cached_partition_statistics(plan) {
+            return Ok(cached);
+        }
+
+        let n = plan.properties().partitioning.partition_count();
+        if n == 0 {
+            let empty: Arc<[Arc<Statistics>]> = Arc::from([]);
+            if let Some(owner) = retained_plan {
+                self.store_partition_statistics(owner, Arc::clone(&empty));
+            }
+            return Ok(empty);
+        }
+
+        let children = plan.children();
+        let out = if !self.registry.providers().is_empty() {
+            let mut out = Vec::with_capacity(n);
+            let mut args = StatisticsArgs::new();
+            for i in 0..n {
+                args.set_partition(Some(i));
+                let (s, _) = self.compute_base(plan, None, &args, false)?;
+                out.push(s);
+            }
+            out
+        } else if children.is_empty() {
+            let mut out = Vec::with_capacity(n);
+            let mut args = StatisticsArgs::new();
+            for i in 0..n {
+                args.set_partition(Some(i));
+                out.push(plan.statistics_from_inputs(&[], &args)?);
+            }
+            out
+        } else if plan.partition_stats_mode()
+            == PartitionStatsMode::ElementwiseFromChildren
+        {
+            let child_parts: Vec<Arc<[Arc<Statistics>]>> = children
+                .iter()
+                .enumerate()
+                .map(|(i, child)| {
+                    self.compute_partitions_base(child.as_ref(), Some(child))
+                        .map_err(|e| {
+                            e.context(format!(
+                                "computing partition statistics for child {i} ({}) of {}",
+                                child.name(),
+                                plan.name()
+                            ))
+                        })
+                })
+                .collect::<Result<_>>()?;
+            for (child, parts) in children.iter().zip(&child_parts) {
+                assert_eq_or_internal_err!(
+                    parts.len(),
+                    n,
+                    "{} declared ElementwiseFromChildren ({n} partitions) for child {} with {} partitions",
+                    plan.name(),
+                    child.name(),
+                    parts.len()
+                );
+            }
+            Self::compute_elementwise_partitions(plan, &child_parts, n)?
+        } else {
+            let mut out = Vec::with_capacity(n);
+            let mut args = StatisticsArgs::new();
+            for i in 0..n {
+                args.set_partition(Some(i));
+                let (s, _) = self.compute_base(plan, None, &args, false)?;
+                out.push(s);
+            }
+            out
+        };
+
+        let result: Arc<[Arc<Statistics>]> = out.into();
+        if let Some(owner) = retained_plan {
+            self.store_partition_statistics(owner, Arc::clone(&result));
+        }
+        Ok(result)
+    }
+
+    fn compute_elementwise_partitions(
+        plan: &dyn ExecutionPlan,
+        child_parts: &[Arc<[Arc<Statistics>]>],
+        n: usize,
+    ) -> Result<Vec<Arc<Statistics>>> {
+        let args = StatisticsArgs::new().with_partition(Some(0));
+        let mut out = Vec::with_capacity(n);
+
+        // `child_parts` keeps every child `Arc<Statistics>` alive across this
+        // call, so `Arc::as_ptr` addresses uniquely identify distinct `Arc`s.
+        match child_parts {
+            [c0] => {
+                let mut memo: HashMap<usize, Arc<Statistics>> = HashMap::default();
+                let mut prev_ptr = 0usize;
+                let mut prev_out: Option<Arc<Statistics>> = None;
+                for s0 in c0.iter() {
+                    let ptr = Arc::as_ptr(s0) as usize;
+                    if ptr == prev_ptr
+                        && let Some(prev) = &prev_out
+                    {
+                        out.push(Arc::clone(prev));
+                        continue;
+                    }
+                    let computed = match memo.get(&ptr) {
+                        Some(existing) => Arc::clone(existing),
+                        None => {
+                            let res = plan.statistics_from_inputs(
+                                std::slice::from_ref(s0),
+                                &args,
+                            )?;
+                            memo.insert(ptr, Arc::clone(&res));
+                            res
+                        }
+                    };
+                    prev_ptr = ptr;
+                    prev_out = Some(Arc::clone(&computed));
+                    out.push(computed);
+                }
+            }
+            [c0, c1] => {
+                let mut memo: HashMap<(usize, usize), Arc<Statistics>> =
+                    HashMap::default();
+                let mut prev_key = (0usize, 0usize);
+                let mut prev_out: Option<Arc<Statistics>> = None;
+                for (s0, s1) in c0.iter().zip(c1.iter()) {
+                    let key = (Arc::as_ptr(s0) as usize, Arc::as_ptr(s1) as usize);
+                    if key == prev_key
+                        && let Some(prev) = &prev_out
+                    {
+                        out.push(Arc::clone(prev));
+                        continue;
+                    }
+                    let computed = match memo.get(&key) {
+                        Some(existing) => Arc::clone(existing),
+                        None => {
+                            let inputs = [Arc::clone(s0), Arc::clone(s1)];
+                            let res = plan.statistics_from_inputs(&inputs, &args)?;
+                            memo.insert(key, Arc::clone(&res));
+                            res
+                        }
+                    };
+                    prev_key = key;
+                    prev_out = Some(Arc::clone(&computed));
+                    out.push(computed);
+                }
+            }
+            _ => {
+                let mut memo: HashMap<Vec<usize>, Arc<Statistics>> = HashMap::default();
+                let mut inputs = Vec::with_capacity(child_parts.len());
+                for i in 0..n {
+                    let key: Vec<usize> = child_parts
+                        .iter()
+                        .map(|c| Arc::as_ptr(&c[i]) as usize)
+                        .collect();
+                    if let Some(existing) = memo.get(&key) {
+                        out.push(Arc::clone(existing));
+                        continue;
+                    }
+                    inputs.clear();
+                    inputs.extend(child_parts.iter().map(|c| Arc::clone(&c[i])));
+                    let res = plan.statistics_from_inputs(&inputs, &args)?;
+                    memo.insert(key, Arc::clone(&res));
+                    out.push(res);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     fn cached_statistics(
         &self,
         plan: &dyn ExecutionPlan,
         partition: Option<usize>,
     ) -> Option<Arc<Statistics>> {
+        let cache = self.cache.lock();
+        if let Some(entry) = cache.statistics.get(&cache_key(plan, partition)) {
+            return Some(Arc::clone(&entry.value));
+        }
+        if let Some(idx) = partition
+            && let Some(entry) = cache.partition_statistics.get(&plan_addr(plan))
+        {
+            return entry.value.get(idx).cloned();
+        }
+        None
+    }
+
+    fn cached_partition_statistics(
+        &self,
+        plan: &dyn ExecutionPlan,
+    ) -> Option<Arc<[Arc<Statistics>]>> {
         self.cache
             .lock()
-            .statistics
-            .get(&cache_key(plan, partition))
+            .partition_statistics
+            .get(&plan_addr(plan))
             .map(|entry| Arc::clone(&entry.value))
+    }
+
+    fn store_partition_statistics(
+        &self,
+        owner: &Arc<dyn ExecutionPlan>,
+        statistics: Arc<[Arc<Statistics>]>,
+    ) {
+        self.cache.lock().partition_statistics.insert(
+            plan_addr(owner.as_ref()),
+            CacheEntry {
+                _plan: Arc::clone(owner),
+                value: statistics,
+            },
+        );
     }
 
     /// Inserts `value` keyed by `owner`'s pointer, retaining `owner` so the
@@ -1166,6 +1436,343 @@ mod tests {
             num_rows(Precision::Exact(400), None, 4, &overall)?,
             Precision::Exact(400)
         );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod partition_stats_tests {
+    use super::*;
+    use crate::operator_statistics::StatisticsProvider;
+    use crate::union::UnionExec;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion_common::{ColumnStatistics, stats::Precision};
+
+    #[derive(Debug)]
+    struct PartitionRowCountProvider;
+    impl StatisticsProvider for PartitionRowCountProvider {
+        fn compute_statistics_with_args(
+            &self,
+            plan: &dyn ExecutionPlan,
+            _child_stats: &[ExtendedStatistics],
+            args: &StatisticsArgs,
+        ) -> Result<StatisticsResult> {
+            let marker = 700 + args.partition().map_or(0, |p| p + 1);
+            let mut stats = Statistics::new_unknown(&plan.schema());
+            stats.num_rows = Precision::Exact(marker);
+            Ok(StatisticsResult::Computed(ExtendedStatistics::new(stats)))
+        }
+    }
+
+    #[test]
+    fn compute_partitions_matches_per_partition_and_deduplicates() -> Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use crate::DisplayAs;
+        use crate::DisplayFormatType;
+        use crate::PlanProperties;
+        use crate::execution_plan::{Boundedness, EmissionType};
+        use crate::filter::FilterExec;
+        use crate::joins::{HashJoinExec, PartitionMode};
+        use crate::projection::ProjectionExec;
+        use crate::repartition::RepartitionExec;
+        use datafusion_common::tree_node::TreeNodeRecursion;
+        use datafusion_common::{NullEquality, ScalarValue};
+        use datafusion_execution::{SendableRecordBatchStream, TaskContext};
+        use datafusion_expr::{JoinType, Operator};
+        use datafusion_physical_expr::expressions::{BinaryExpr, col, lit};
+        use datafusion_physical_expr::{
+            EquivalenceProperties, Partitioning, PhysicalExpr,
+        };
+
+        #[derive(Debug)]
+        struct SharedEmptyLeafExec {
+            partition_stats: Vec<Arc<Statistics>>,
+            overall_stats: Arc<Statistics>,
+            cache: Arc<PlanProperties>,
+        }
+
+        impl DisplayAs for SharedEmptyLeafExec {
+            fn fmt_as(
+                &self,
+                _t: DisplayFormatType,
+                f: &mut std::fmt::Formatter,
+            ) -> std::fmt::Result {
+                write!(f, "SharedEmptyLeafExec")
+            }
+        }
+
+        impl ExecutionPlan for SharedEmptyLeafExec {
+            fn name(&self) -> &'static str {
+                "SharedEmptyLeafExec"
+            }
+
+            fn properties(&self) -> &Arc<PlanProperties> {
+                &self.cache
+            }
+
+            fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+                vec![]
+            }
+
+            fn apply_expressions(
+                &self,
+                _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+            ) -> Result<TreeNodeRecursion> {
+                Ok(TreeNodeRecursion::Continue)
+            }
+
+            fn with_new_children(
+                self: Arc<Self>,
+                _children: Vec<Arc<dyn ExecutionPlan>>,
+            ) -> Result<Arc<dyn ExecutionPlan>> {
+                Ok(self)
+            }
+
+            fn execute(
+                &self,
+                _partition: usize,
+                _context: Arc<TaskContext>,
+            ) -> Result<SendableRecordBatchStream> {
+                unimplemented!()
+            }
+
+            fn statistics_from_inputs(
+                &self,
+                _input_stats: &[Arc<Statistics>],
+                args: &StatisticsArgs,
+            ) -> Result<Arc<Statistics>> {
+                match args.partition() {
+                    Some(idx) => Ok(Arc::clone(&self.partition_stats[idx])),
+                    None => Ok(Arc::clone(&self.overall_stats)),
+                }
+            }
+        }
+
+        #[derive(Debug)]
+        struct CountingElementwiseExec {
+            input: Arc<dyn ExecutionPlan>,
+            calls: Arc<AtomicUsize>,
+        }
+
+        impl DisplayAs for CountingElementwiseExec {
+            fn fmt_as(
+                &self,
+                _t: DisplayFormatType,
+                f: &mut std::fmt::Formatter,
+            ) -> std::fmt::Result {
+                write!(f, "CountingElementwiseExec")
+            }
+        }
+
+        impl ExecutionPlan for CountingElementwiseExec {
+            fn name(&self) -> &'static str {
+                "CountingElementwiseExec"
+            }
+
+            fn properties(&self) -> &Arc<PlanProperties> {
+                self.input.properties()
+            }
+
+            fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+                vec![&self.input]
+            }
+
+            fn apply_expressions(
+                &self,
+                _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+            ) -> Result<TreeNodeRecursion> {
+                Ok(TreeNodeRecursion::Continue)
+            }
+
+            fn with_new_children(
+                self: Arc<Self>,
+                children: Vec<Arc<dyn ExecutionPlan>>,
+            ) -> Result<Arc<dyn ExecutionPlan>> {
+                Ok(Arc::new(Self {
+                    input: Arc::clone(&children[0]),
+                    calls: Arc::clone(&self.calls),
+                }))
+            }
+
+            fn execute(
+                &self,
+                partition: usize,
+                context: Arc<TaskContext>,
+            ) -> Result<SendableRecordBatchStream> {
+                self.input.execute(partition, context)
+            }
+
+            fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {
+                vec![ChildStats::At(partition)]
+            }
+
+            fn partition_stats_mode(&self) -> PartitionStatsMode {
+                PartitionStatsMode::ElementwiseFromChildren
+            }
+
+            fn statistics_from_inputs(
+                &self,
+                input_stats: &[Arc<Statistics>],
+                _args: &StatisticsArgs,
+            ) -> Result<Arc<Statistics>> {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                Ok(Arc::clone(&input_stats[0]))
+            }
+        }
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Int64, false),
+        ]));
+        let n_partitions = 20usize;
+        let empty = Arc::new(
+            Statistics::new_unknown(&schema)
+                .with_num_rows(Precision::Exact(0))
+                .with_total_byte_size(Precision::Exact(0)),
+        );
+        // Interleave 4 distinct non-empty partitions at indices 0, 5, 10, 15
+        // with 16 empty partitions sharing `empty`.
+        let make_leaf = || -> Arc<dyn ExecutionPlan> {
+            let partition_stats: Vec<Arc<Statistics>> = (0..n_partitions)
+                .map(|i| {
+                    if i % 5 == 0 {
+                        let rows = 100 + i * 10;
+                        Arc::new(Statistics {
+                            num_rows: Precision::Exact(rows),
+                            total_byte_size: Precision::Exact(rows * 16),
+                            column_statistics: vec![
+                                ColumnStatistics {
+                                    null_count: Precision::Exact(0),
+                                    min_value: Precision::Exact(ScalarValue::Int64(
+                                        Some(i as i64 * 1000),
+                                    )),
+                                    max_value: Precision::Exact(ScalarValue::Int64(
+                                        Some(i as i64 * 1000 + 99),
+                                    )),
+                                    ..ColumnStatistics::new_unknown()
+                                },
+                                ColumnStatistics::new_unknown(),
+                            ],
+                        })
+                    } else {
+                        Arc::clone(&empty)
+                    }
+                })
+                .collect();
+            let cache = Arc::new(PlanProperties::new(
+                EquivalenceProperties::new(Arc::clone(&schema)),
+                Partitioning::UnknownPartitioning(n_partitions),
+                EmissionType::Incremental,
+                Boundedness::Bounded,
+            ));
+            Arc::new(SharedEmptyLeafExec {
+                partition_stats,
+                overall_stats: Arc::new(
+                    Statistics::new_unknown(&schema).with_num_rows(Precision::Exact(700)),
+                ),
+                cache,
+            })
+        };
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let build_branch =
+            |counter: Option<&Arc<AtomicUsize>>| -> Result<Arc<dyn ExecutionPlan>> {
+                let mut node = make_leaf();
+                if let Some(c) = counter {
+                    node = Arc::new(CountingElementwiseExec {
+                        input: node,
+                        calls: Arc::clone(c),
+                    });
+                }
+                let pred: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+                    col("b", &schema)?,
+                    Operator::Gt,
+                    lit(0i64),
+                ));
+                let filter: Arc<dyn ExecutionPlan> =
+                    Arc::new(FilterExec::try_new(pred, node)?);
+                Ok(Arc::new(ProjectionExec::try_new(
+                    vec![
+                        (col("a", &schema)?, "a".to_string()),
+                        (col("b", &schema)?, "b".to_string()),
+                    ],
+                    filter,
+                )?))
+            };
+
+        let left = build_branch(Some(&calls))?;
+        let right = build_branch(None)?;
+        let join: Arc<dyn ExecutionPlan> = Arc::new(HashJoinExec::try_new(
+            Arc::clone(&left),
+            Arc::clone(&right),
+            vec![(col("a", &schema)?, col("a", &schema)?)],
+            None,
+            &JoinType::Inner,
+            None,
+            PartitionMode::Partitioned,
+            NullEquality::NullEqualsNothing,
+            false,
+        )?);
+
+        // 1. Elementwise tree: 4 distinct active + 1 shared empty => 5 evaluations (not 20),
+        //    and every partition matches single-partition `compute`.
+        calls.store(0, Ordering::SeqCst);
+        let batch_ctx = StatisticsContext::new();
+        let batch = batch_ctx.compute_partitions_arc(&join)?;
+        assert_eq!(calls.load(Ordering::Relaxed), 5);
+        assert_eq!(batch.len(), n_partitions);
+
+        let single_ctx = StatisticsContext::new();
+        for (i, got) in batch.iter().enumerate() {
+            let expected = single_ctx.compute(
+                join.as_ref(),
+                &StatisticsArgs::new().with_partition(Some(i)),
+            )?;
+            assert_eq!(got.as_ref(), expected.as_ref(), "partition {i} mismatch");
+            // Subsequent single-partition lookup on `batch_ctx` hits the cached slice.
+            let from_slice_cache = batch_ctx.compute(
+                join.as_ref(),
+                &StatisticsArgs::new().with_partition(Some(i)),
+            )?;
+            assert!(Arc::ptr_eq(got, &from_slice_cache));
+        }
+
+        // 2. PerPartitionIndex operators (`UnionExec` and `RepartitionExec`) + providers.
+        let union = UnionExec::try_new(vec![left, right])?;
+        let union_batch = StatisticsContext::new().compute_partitions(union.as_ref())?;
+        assert_eq!(union_batch.len(), n_partitions * 2);
+        for (i, got) in union_batch.iter().enumerate() {
+            let expected = StatisticsContext::new().compute(
+                union.as_ref(),
+                &StatisticsArgs::new().with_partition(Some(i)),
+            )?;
+            assert_eq!(got.as_ref(), expected.as_ref(), "union partition {i}");
+        }
+
+        let repart: Arc<dyn ExecutionPlan> = Arc::new(RepartitionExec::try_new(
+            Arc::clone(&join),
+            Partitioning::RoundRobinBatch(4),
+        )?);
+        let repart_batch =
+            StatisticsContext::new().compute_partitions(repart.as_ref())?;
+        assert_eq!(repart_batch.len(), 4);
+        for (i, got) in repart_batch.iter().enumerate() {
+            let expected = StatisticsContext::new().compute(
+                repart.as_ref(),
+                &StatisticsArgs::new().with_partition(Some(i)),
+            )?;
+            assert_eq!(got.as_ref(), expected.as_ref(), "repart partition {i}");
+        }
+
+        let provider_ctx = StatisticsContext::new_with_registry(
+            StatisticsRegistry::with_providers(vec![Arc::new(PartitionRowCountProvider)]),
+        );
+        let prov_batch = provider_ctx.compute_partitions(join.as_ref())?;
+        for (i, got) in prov_batch.iter().enumerate() {
+            assert_eq!(got.num_rows, Precision::Exact(701 + i));
+        }
+
         Ok(())
     }
 }

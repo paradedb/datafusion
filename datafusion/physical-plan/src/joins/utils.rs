@@ -463,6 +463,25 @@ pub(crate) fn estimate_join_statistics(
     join_type: &JoinType,
     schema: &Schema,
 ) -> Result<Statistics> {
+    let left_empty = left_stats.num_rows == Precision::Exact(0);
+    let right_empty = right_stats.num_rows == Precision::Exact(0);
+    let known_empty = match join_type {
+        JoinType::Inner | JoinType::LeftSemi | JoinType::RightSemi => {
+            left_empty || right_empty
+        }
+        JoinType::Left | JoinType::LeftAnti | JoinType::LeftMark => left_empty,
+        JoinType::Right | JoinType::RightAnti | JoinType::RightMark => right_empty,
+        JoinType::Full => left_empty && right_empty,
+    };
+    if known_empty {
+        return Ok(Statistics {
+            num_rows: Precision::Exact(0),
+            total_byte_size: Precision::Exact(0),
+            column_statistics: Statistics::unknown_column(schema),
+            ..Default::default()
+        });
+    }
+
     let join_stats =
         estimate_join_cardinality(join_type, left_stats, right_stats, on, null_equality);
     let (num_rows, total_byte_size, column_statistics) = match join_stats {
